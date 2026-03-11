@@ -6,7 +6,7 @@ use iced::advanced::{
     self, layout,
     renderer::{self},
     widget::Tree,
-    Clipboard, Layout, Shell, Widget,
+    Layout, Shell, Widget,
 };
 use iced::keyboard;
 use iced::mouse::{self, Interaction};
@@ -674,14 +674,14 @@ where
                     height: self.content_height,
                 };
                 renderer.draw_image(
-                    core_image::Image::new(self.handle.clone()).snap(true),
+                    core_image::Image::new(self.handle.clone()),
                     image_bounds,
                     *viewport,
                 );
             });
         } else {
             renderer.draw_image(
-                core_image::Image::new(self.handle.clone()).snap(true),
+                core_image::Image::new(self.handle.clone()),
                 bounds,
                 *viewport,
             );
@@ -718,7 +718,6 @@ where
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &Renderer,
-        _clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Action>,
         _viewport: &Rectangle,
     ) {
