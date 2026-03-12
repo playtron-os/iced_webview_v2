@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use iced::advanced::image as core_image;
@@ -78,6 +79,8 @@ where
     /// Per-view navigation epoch. Incremented on `GoToUrl` so that image
     /// fetches spawned for a previous page are discarded when they complete.
     nav_epochs: HashMap<ViewId, u64>,
+    /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
+    detected_scale: Arc<AtomicU32>,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView<Engine, Message> {
@@ -121,6 +124,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             action_mapper: None,
             inflight_images: 0,
             nav_epochs: HashMap::new(),
+            detected_scale: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -136,6 +140,19 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     pub fn set_scale_factor(&mut self, scale: f32) {
         self.scale_factor = scale;
         self.engine.set_scale_factor(scale);
+    }
+
+    /// Reads the scale factor detected by the shader viewport and applies it
+    /// to the engine if it differs from the current value.
+    fn apply_detected_scale(&mut self) {
+        let bits = self.detected_scale.load(Ordering::Relaxed);
+        if bits == 0 {
+            return;
+        }
+        let detected = f32::from_bits(bits);
+        if detected > 0.0 && (detected - self.scale_factor).abs() > 0.01 {
+            self.set_scale_factor(detected);
+        }
     }
 
     /// subscribe to create view events
@@ -344,6 +361,9 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 return Task::batch(tasks);
             }
             Action::Update => {
+                // Auto-detect display scale from the GPU viewport.
+                self.apply_detected_scale();
+
                 self.engine.update();
                 if self.current_view_index.is_some() {
                     let view_id = self.get_current_view_id();
@@ -496,6 +516,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 iced::widget::Shader::new(WebViewShaderProgram::new(
                     self.engine.get_view(id),
                     self.engine.get_cursor(id),
+                    self.detected_scale.clone(),
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill)

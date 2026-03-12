@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use iced::mouse::{self, Interaction};
@@ -17,11 +18,20 @@ use crate::ImageInfo;
 pub struct WebViewShaderProgram<'a> {
     image_info: &'a ImageInfo,
     cursor: Interaction,
+    detected_scale: Arc<AtomicU32>,
 }
 
 impl<'a> WebViewShaderProgram<'a> {
-    pub fn new(image_info: &'a ImageInfo, cursor: Interaction) -> Self {
-        Self { image_info, cursor }
+    pub fn new(
+        image_info: &'a ImageInfo,
+        cursor: Interaction,
+        detected_scale: Arc<AtomicU32>,
+    ) -> Self {
+        Self {
+            image_info,
+            cursor,
+            detected_scale,
+        }
     }
 }
 
@@ -35,6 +45,8 @@ pub struct WebViewPrimitive {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixel_format: PixelFormat,
+    /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
+    pub(crate) detected_scale: Arc<AtomicU32>,
 }
 
 impl std::fmt::Debug for WebViewPrimitive {
@@ -137,8 +149,13 @@ impl shader::Primitive for WebViewPrimitive {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         _bounds: &Rectangle,
-        _viewport: &shader::Viewport,
+        viewport: &shader::Viewport,
     ) {
+        // Store the display scale factor so the WebView can pick it up
+        // and inform the engine (e.g. CEF's device_scale_factor).
+        self.detected_scale
+            .store(viewport.scale_factor().to_bits(), Ordering::Relaxed);
+
         let needed_format = to_wgpu_format(&self.pixel_format);
         if (self.width, self.height) != pipeline.texture_size
             || needed_format != pipeline.texture_format
@@ -359,6 +376,7 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
             width: self.image_info.image_width(),
             height: self.image_info.image_height(),
             pixel_format: self.image_info.pixel_format().clone(),
+            detected_scale: self.detected_scale.clone(),
         }
     }
 

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use iced::advanced::image as core_image;
@@ -69,6 +70,8 @@ where
     action_mapper: Option<Arc<dyn Fn(Action) -> Message + Send + Sync>>,
     inflight_images: usize,
     nav_epochs: HashMap<ViewId, u64>,
+    /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
+    detected_scale: Arc<AtomicU32>,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
@@ -89,6 +92,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             action_mapper: None,
             inflight_images: 0,
             nav_epochs: HashMap::new(),
+            detected_scale: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -103,6 +107,19 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     pub fn set_scale_factor(&mut self, scale: f32) {
         self.scale_factor = scale;
         self.engine.set_scale_factor(scale);
+    }
+
+    /// Reads the scale factor detected by the shader viewport and applies it
+    /// to the engine if it differs from the current value.
+    fn apply_detected_scale(&mut self) {
+        let bits = self.detected_scale.load(Ordering::Relaxed);
+        if bits == 0 {
+            return;
+        }
+        let detected = f32::from_bits(bits);
+        if detected > 0.0 && (detected - self.scale_factor).abs() > 0.01 {
+            self.set_scale_factor(detected);
+        }
     }
 
     /// Subscribe to create view events
@@ -299,6 +316,9 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 return Task::batch(tasks);
             }
             Action::Update(id) => {
+                // Auto-detect display scale from the GPU viewport.
+                self.apply_detected_scale();
+
                 self.engine.update();
                 self.engine.request_render(id, self.view_size);
 
@@ -342,6 +362,9 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 return Task::batch(tasks);
             }
             Action::UpdateAll => {
+                // Auto-detect display scale from the GPU viewport.
+                self.apply_detected_scale();
+
                 self.engine.update();
 
                 if self.inflight_images == 0 {
@@ -475,6 +498,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     id,
                     self.engine.get_view(id),
                     self.engine.get_cursor(id),
+                    self.detected_scale.clone(),
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -502,15 +526,22 @@ struct AdvancedShaderProgram<'a> {
     view_id: ViewId,
     image_info: &'a ImageInfo,
     cursor: Interaction,
+    detected_scale: Arc<AtomicU32>,
 }
 
 #[cfg(any(feature = "servo", feature = "cef"))]
 impl<'a> AdvancedShaderProgram<'a> {
-    fn new(view_id: ViewId, image_info: &'a ImageInfo, cursor: Interaction) -> Self {
+    fn new(
+        view_id: ViewId,
+        image_info: &'a ImageInfo,
+        cursor: Interaction,
+        detected_scale: Arc<AtomicU32>,
+    ) -> Self {
         Self {
             view_id,
             image_info,
             cursor,
+            detected_scale,
         }
     }
 }
@@ -588,6 +619,7 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
             width: self.image_info.image_width(),
             height: self.image_info.image_height(),
             pixel_format: self.image_info.pixel_format().clone(),
+            detected_scale: self.detected_scale.clone(),
         }
     }
 
