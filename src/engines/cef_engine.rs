@@ -283,6 +283,13 @@ impl Default for Cef {
             eprintln!("  cache: {cef_cache}");
         }
 
+        // CEF's initialize() installs its own signal handlers that swallow
+        // SIGINT — restore the default so a single Ctrl+C terminates the app.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        }
+
         Self {
             views: Vec::new(),
             scale_factor: 1.0,

@@ -40,7 +40,7 @@ blitz = [
 ]
 litehtml = ["dep:litehtml", "dep:reqwest"]
 servo = ["dep:servo", "dep:urlencoding", "dep:rustls", "dep:euclid", "dep:keyboard-types-servo", "dep:dpi", "iced/wgpu"]
-cef = ["dep:cef", "dep:urlencoding", "iced/wgpu"]
+cef = ["dep:cef", "dep:urlencoding", "dep:libc", "iced/wgpu"]
 docs_only = []
 
 [dependencies]
@@ -74,6 +74,7 @@ dpi = { version = "0.1", optional = true }
 
 # CEF engine deps
 cef = { version = "145", default-features = false, optional = true }
+libc = { version = "0.2", optional = true }
 
 # When both blitz and servo features are resolved, Cargo sees two copies of
 # stylo (crates.io for blitz, git for servo). Patch crates.io to use servo's

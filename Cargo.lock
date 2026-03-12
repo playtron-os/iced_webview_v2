@@ -3637,6 +3637,7 @@ dependencies = [
  "iced",
  "keyboard-types 0.7.0",
  "keyboard-types 0.8.3",
+ "libc",
  "libservo",
  "litehtml",
  "peniko 0.6.0",
