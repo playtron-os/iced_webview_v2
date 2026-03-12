@@ -151,6 +151,11 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         }
         let detected = f32::from_bits(bits);
         if detected > 0.0 && (detected - self.scale_factor).abs() > 0.01 {
+            log::info!(
+                "iced_webview: auto-detected display scale {:.2} (was {:.2})",
+                detected,
+                self.scale_factor
+            );
             self.set_scale_factor(detected);
         }
     }
