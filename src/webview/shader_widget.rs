@@ -5,6 +5,7 @@ use iced::wgpu;
 use iced::widget::shader;
 use iced::{keyboard, Event, Point, Rectangle, Size};
 
+use crate::engines::PixelFormat;
 use crate::webview::basic::Action;
 use crate::ImageInfo;
 
@@ -33,6 +34,7 @@ pub struct WebViewPrimitive {
     pub(crate) pixels: Arc<Vec<u8>>,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) pixel_format: PixelFormat,
 }
 
 impl std::fmt::Debug for WebViewPrimitive {
@@ -52,11 +54,23 @@ pub struct WebViewPipeline {
     bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
     texture_size: (u32, u32),
+    /// Current texture pixel format so we can recreate with the right format.
+    texture_format: wgpu::TextureFormat,
+    /// Tracks the data pointer of the last uploaded pixel buffer.
+    /// When the Arc points to the same allocation, the frame is unchanged
+    /// and `write_texture()` can be skipped entirely.
+    last_pixels_ptr: usize,
 }
 
 impl WebViewPipeline {
-    fn recreate_texture(&mut self, device: &wgpu::Device, width: u32, height: u32) {
-        let (texture, texture_view) = create_texture(device, width.max(1), height.max(1));
+    fn recreate_texture(
+        &mut self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) {
+        let (texture, texture_view) = create_texture(device, width.max(1), height.max(1), format);
 
         self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("webview_bind_group"),
@@ -76,6 +90,15 @@ impl WebViewPipeline {
         self.texture = texture;
         self.texture_view = texture_view;
         self.texture_size = (width, height);
+        self.texture_format = format;
+    }
+}
+
+/// Maps our `PixelFormat` to the matching wgpu texture format.
+fn to_wgpu_format(pf: &PixelFormat) -> wgpu::TextureFormat {
+    match pf {
+        PixelFormat::Bgra => wgpu::TextureFormat::Bgra8UnormSrgb,
+        PixelFormat::Rgba => wgpu::TextureFormat::Rgba8UnormSrgb,
     }
 }
 
@@ -83,6 +106,7 @@ fn create_texture(
     device: &wgpu::Device,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("webview_texture"),
@@ -94,7 +118,7 @@ fn create_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
@@ -115,8 +139,19 @@ impl shader::Primitive for WebViewPrimitive {
         _bounds: &Rectangle,
         _viewport: &shader::Viewport,
     ) {
-        if (self.width, self.height) != pipeline.texture_size {
-            pipeline.recreate_texture(device, self.width, self.height);
+        let needed_format = to_wgpu_format(&self.pixel_format);
+        if (self.width, self.height) != pipeline.texture_size
+            || needed_format != pipeline.texture_format
+        {
+            pipeline.recreate_texture(device, self.width, self.height, needed_format);
+            // Force re-upload after texture recreation
+            pipeline.last_pixels_ptr = 0;
+        }
+
+        // Skip upload when the pixel buffer hasn't changed (same Arc allocation).
+        let current_ptr = Arc::as_ptr(&self.pixels) as usize;
+        if current_ptr == pipeline.last_pixels_ptr {
+            return;
         }
 
         let expected_len = 4 * self.width as usize * self.height as usize;
@@ -140,6 +175,7 @@ impl shader::Primitive for WebViewPrimitive {
                     depth_or_array_layers: 1,
                 },
             );
+            pipeline.last_pixels_ptr = current_ptr;
         }
     }
 
@@ -158,7 +194,8 @@ impl shader::Primitive for WebViewPrimitive {
 
 impl shader::Pipeline for WebViewPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let (texture, texture_view) = create_texture(device, 1, 1);
+        let initial_tex_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let (texture, texture_view) = create_texture(device, 1, 1, initial_tex_format);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("webview_sampler"),
@@ -252,6 +289,8 @@ impl shader::Pipeline for WebViewPipeline {
             bind_group,
             render_pipeline,
             texture_size: (1, 1),
+            texture_format: initial_tex_format,
+            last_pixels_ptr: 0,
         }
     }
 }
@@ -319,6 +358,7 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
             pixels: self.image_info.pixels(),
             width: self.image_info.image_width(),
             height: self.image_info.image_height(),
+            pixel_format: self.image_info.pixel_format().clone(),
         }
     }
 

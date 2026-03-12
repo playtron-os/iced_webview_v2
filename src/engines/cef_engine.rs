@@ -393,8 +393,18 @@ impl Engine for Cef {
             let mut shared = view.shared.borrow_mut();
 
             if let Some((pixels, w, h)) = shared.frame_buffer.take() {
+                let t0 = std::time::Instant::now();
                 view.last_frame = ImageInfo::new(pixels, PixelFormat::Bgra, w, h);
                 view.needs_render = false;
+                let elapsed = t0.elapsed();
+                if elapsed.as_millis() > 2 {
+                    eprintln!(
+                        "[cef] new frame {}x{} in {}µs (slow)",
+                        w,
+                        h,
+                        elapsed.as_micros()
+                    );
+                }
             }
             if let Some(url) = shared.url.take() {
                 view.url = url;

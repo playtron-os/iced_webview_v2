@@ -32,6 +32,7 @@ pub enum PageType {
 }
 
 /// Enables browser engines to display their images in different formats
+#[derive(Clone, Debug)]
 pub enum PixelFormat {
     /// RGBA
     Rgba,

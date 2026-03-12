@@ -587,6 +587,7 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
             pixels: self.image_info.pixels(),
             width: self.image_info.image_width(),
             height: self.image_info.image_height(),
+            pixel_format: self.image_info.pixel_format().clone(),
         }
     }
 

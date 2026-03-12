@@ -1244,6 +1244,8 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
+ "serde",
+ "termcolor",
  "unicode-width",
 ]
 
@@ -2052,7 +2054,7 @@ dependencies = [
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/playtron-os/winit.git?rev=33d27353#33d273530141b4ecbf74acf0080c8b21dc3bfa3d"
+source = "git+https://github.com/playtron-os/winit.git?rev=076e79ab#076e79ab52c31c176cb00a273a7a2b1a09654ed9"
 
 [[package]]
 name = "dpi"
@@ -2992,6 +2994,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-allocator"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "51255ea7cfaadb6c5f1528d43e92a82acb2b96c43365989a28b2d44ee38f8795"
+dependencies = [
+ "ash",
+ "hashbrown 0.16.1",
+ "log",
+ "presser",
+ "thiserror 2.0.18",
+ "windows 0.58.0",
+]
+
+[[package]]
 name = "gpu-descriptor"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3134,6 +3150,8 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.2.0",
 ]
 
@@ -3478,7 +3496,7 @@ dependencies = [
 [[package]]
 name = "iced"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "iced_core",
  "iced_debug",
@@ -3494,7 +3512,7 @@ dependencies = [
 [[package]]
 name = "iced_core"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "bitflags 2.11.0",
  "bytes",
@@ -3511,7 +3529,7 @@ dependencies = [
 [[package]]
 name = "iced_debug"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "iced_core",
  "iced_futures",
@@ -3521,7 +3539,7 @@ dependencies = [
 [[package]]
 name = "iced_futures"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "futures",
  "iced_core",
@@ -3535,7 +3553,7 @@ dependencies = [
 [[package]]
 name = "iced_graphics"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
@@ -3555,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "iced_program"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "iced_graphics",
  "iced_runtime",
@@ -3564,7 +3582,7 @@ dependencies = [
 [[package]]
 name = "iced_renderer"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "iced_graphics",
  "iced_tiny_skia",
@@ -3576,7 +3594,7 @@ dependencies = [
 [[package]]
 name = "iced_runtime"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "bytes",
  "iced_core",
@@ -3588,7 +3606,7 @@ dependencies = [
 [[package]]
 name = "iced_tiny_skia"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "bytemuck",
  "cosmic-text 0.18.0",
@@ -3633,7 +3651,7 @@ dependencies = [
 [[package]]
 name = "iced_wgpu"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "bitflags 2.11.0",
  "bytemuck",
@@ -3652,7 +3670,7 @@ dependencies = [
 [[package]]
 name = "iced_widget"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "iced_renderer",
  "log",
@@ -3666,7 +3684,7 @@ dependencies = [
 [[package]]
 name = "iced_winit"
 version = "0.15.0-dev"
-source = "git+https://github.com/playtron-os/iced.git?rev=9d3351ed#9d3351edf11813cc7c90674a18ba78716a7c432a"
+source = "git+https://github.com/playtron-os/iced.git?rev=967381ae#967381ae0b92443e71f6ba98020b7ecf04ea157d"
 dependencies = [
  "arboard",
  "iced_debug",
@@ -5101,6 +5119,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "metal"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7047791b5bc903b8cd963014b355f71dc9864a9a0b727057676c1dcae5cbc15"
+dependencies = [
+ "bitflags 2.11.0",
+ "block",
+ "core-graphics-types 0.2.0",
+ "foreign-types",
+ "log",
+ "objc",
+ "paste",
+]
+
+[[package]]
 name = "metrics"
 version = "0.0.1"
 source = "git+https://github.com/servo/servo?rev=853fcf4fda0c31ab418c21eac4323d9e91d2b912#853fcf4fda0c31ab418c21eac4323d9e91d2b912"
@@ -5297,6 +5330,7 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rustc-hash 1.1.0",
+ "spirv",
  "thiserror 2.0.18",
  "unicode-ident",
 ]
@@ -8841,6 +8875,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "termcolor"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "text_primitives"
 version = "0.1.0"
 source = "git+https://github.com/linebender/parley?rev=37aa8ab7103e9da89eea22899902016ce20739f2#37aa8ab7103e9da89eea22899902016ce20739f2"
@@ -10309,12 +10352,18 @@ dependencies = [
  "cfg_aliases",
  "document-features",
  "hashbrown 0.16.1",
+ "js-sys",
  "log",
+ "naga 28.0.0",
+ "parking_lot",
  "portable-atomic",
  "profiling",
  "raw-window-handle",
  "smallvec",
  "static_assertions",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu-core 28.0.1",
  "wgpu-hal 28.0.1",
  "wgpu-types 28.0.0",
@@ -10343,8 +10392,8 @@ dependencies = [
  "serde",
  "smallvec",
  "thiserror 2.0.18",
- "wgpu-core-deps-apple",
- "wgpu-core-deps-emscripten",
+ "wgpu-core-deps-apple 26.0.0",
+ "wgpu-core-deps-emscripten 26.0.0",
  "wgpu-core-deps-windows-linux-android 26.0.0",
  "wgpu-hal 26.0.6",
  "wgpu-types 26.0.0",
@@ -10375,6 +10424,8 @@ dependencies = [
  "rustc-hash 1.1.0",
  "smallvec",
  "thiserror 2.0.18",
+ "wgpu-core-deps-apple 28.0.0",
+ "wgpu-core-deps-emscripten 28.0.0",
  "wgpu-core-deps-windows-linux-android 28.0.0",
  "wgpu-hal 28.0.1",
  "wgpu-types 28.0.0",
@@ -10390,12 +10441,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "wgpu-core-deps-apple"
+version = "28.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87b7b696b918f337c486bf93142454080a32a37832ba8a31e4f48221890047da"
+dependencies = [
+ "wgpu-hal 28.0.1",
+]
+
+[[package]]
 name = "wgpu-core-deps-emscripten"
 version = "26.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7670e390f416006f746b4600fdd9136455e3627f5bd763abf9a65daa216dd2d"
 dependencies = [
  "wgpu-hal 26.0.6",
+]
+
+[[package]]
+name = "wgpu-core-deps-emscripten"
+version = "28.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34b251c331f84feac147de3c4aa3aa45112622a95dd7ee1b74384fa0458dbd79"
+dependencies = [
+ "wgpu-hal 28.0.1",
 ]
 
 [[package]]
@@ -10435,7 +10504,7 @@ dependencies = [
  "glow",
  "glutin_wgl_sys",
  "gpu-alloc",
- "gpu-allocator",
+ "gpu-allocator 0.27.0",
  "gpu-descriptor",
  "hashbrown 0.15.5",
  "js-sys",
@@ -10443,7 +10512,7 @@ dependencies = [
  "libc",
  "libloading 0.8.9",
  "log",
- "metal",
+ "metal 0.32.0",
  "naga 26.0.0",
  "ndk-sys",
  "objc",
@@ -10467,18 +10536,46 @@ version = "28.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "44d6cb474beb218824dcc9e1ce679d973f719262789bfb27407da560cac20eeb"
 dependencies = [
+ "android_system_properties",
+ "arrayvec",
+ "ash",
+ "bit-set",
  "bitflags 2.11.0",
+ "block",
+ "bytemuck",
  "cfg-if",
  "cfg_aliases",
+ "core-graphics-types 0.2.0",
+ "glow",
+ "glutin_wgl_sys",
+ "gpu-allocator 0.28.0",
+ "gpu-descriptor",
+ "hashbrown 0.16.1",
+ "js-sys",
+ "khronos-egl",
+ "libc",
  "libloading 0.8.9",
  "log",
+ "metal 0.33.0",
  "naga 28.0.0",
+ "ndk-sys",
+ "objc",
+ "once_cell",
+ "ordered-float",
+ "parking_lot",
  "portable-atomic",
  "portable-atomic-util",
+ "profiling",
+ "range-alloc",
  "raw-window-handle",
  "renderdoc-sys",
+ "smallvec",
  "thiserror 2.0.18",
+ "wasm-bindgen",
+ "web-sys",
  "wgpu-types 28.0.0",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -11037,7 +11134,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.30.12"
-source = "git+https://github.com/playtron-os/winit.git?rev=33d27353#33d273530141b4ecbf74acf0080c8b21dc3bfa3d"
+source = "git+https://github.com/playtron-os/winit.git?rev=076e79ab#076e79ab52c31c176cb00a273a7a2b1a09654ed9"
 dependencies = [
  "ahash",
  "android-activity",

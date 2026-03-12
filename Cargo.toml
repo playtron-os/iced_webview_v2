@@ -39,12 +39,12 @@ blitz = [
     "dep:tokio",
 ]
 litehtml = ["dep:litehtml", "dep:reqwest"]
-servo = ["dep:servo", "dep:urlencoding", "dep:rustls", "dep:euclid", "dep:keyboard-types-servo", "dep:dpi"]
-cef = ["dep:cef", "dep:urlencoding"]
+servo = ["dep:servo", "dep:urlencoding", "dep:rustls", "dep:euclid", "dep:keyboard-types-servo", "dep:dpi", "iced/wgpu"]
+cef = ["dep:cef", "dep:urlencoding", "iced/wgpu"]
 docs_only = []
 
 [dependencies]
-iced = { git = "https://github.com/playtron-os/iced.git", rev = "9d3351ed", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
+iced = { git = "https://github.com/playtron-os/iced.git", rev = "967381ae", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
 #iced = { path = "../iced", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
 rand = "0.8.5"
 litehtml = { version = "0.2.3", features = ["pixbuf", "html"], optional = true }
