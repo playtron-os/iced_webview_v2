@@ -39,14 +39,13 @@ wrap_app! {
             command_line: Option<&mut CommandLine>,
         ) {
             if let Some(cmd) = command_line {
-                // CEF defaults to X11. When WAYLAND_DISPLAY is set, tell
-                // Chromium's ozone layer to use the Wayland backend.
-                if std::env::var("WAYLAND_DISPLAY").is_ok() {
-                    cmd.append_switch_with_value(
-                        Some(&CefString::from("ozone-platform")),
-                        Some(&CefString::from("wayland")),
-                    );
-                }
+                // OSR renders to a pixel buffer — use headless ozone so
+                // CEF doesn't try to connect to X11 or Wayland (which
+                // would conflict with the host iced app's display).
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("headless")),
+                );
 
                 // OSR delivers pixels via on_paint() — GPU compositing
                 // inside CEF isn't needed. Disable it and run any
@@ -240,6 +239,14 @@ impl Default for Cef {
         let cef_cache = format!("{cache_dir}/iced_webview_cef");
         let _ = std::fs::create_dir_all(&cef_cache);
 
+        // Remove stale singleton lock files from previous crashed runs.
+        // Without this, CEF detects an "existing browser session" and
+        // fails to initialize.
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            let lock = std::path::Path::new(&cef_cache).join(name);
+            let _ = std::fs::remove_file(&lock);
+        }
+
         // Point CEF to its distribution directory so subprocesses can find
         // libEGL.so, libGLESv2.so, .pak resources, etc. Without this, the
         // GPU process fails to initialize and crashes.
@@ -269,10 +276,17 @@ impl Default for Cef {
             std::ptr::null_mut(),
         );
 
+        let initialized = result == 1;
+        if !initialized {
+            eprintln!("iced_webview: CEF initialize() returned {result} (expected 1). Browser creation will be skipped.");
+            eprintln!("  cef_dir: {cef_dir_str}");
+            eprintln!("  cache: {cef_cache}");
+        }
+
         Self {
             views: Vec::new(),
             scale_factor: 1.0,
-            initialized: result == 1,
+            initialized,
         }
     }
 }
@@ -313,6 +327,13 @@ pub fn cef_subprocess_check() -> bool {
         true
     };
 
+    // Browser process — no subprocess work needed. Return immediately
+    // without calling execute_process(), which would set up CEF global
+    // state that interferes with the later initialize() call.
+    if is_browser {
+        return false;
+    }
+
     let mut app = OsrApp::new();
     let ret = execute_process(
         Some(args.as_main_args()),
@@ -320,26 +341,16 @@ pub fn cef_subprocess_check() -> bool {
         std::ptr::null_mut(),
     );
 
-    if is_browser {
-        false
-    } else {
-        ret >= 0
-    }
+    ret >= 0
 }
 
 impl Cef {
-    fn find_view(&self, id: ViewId) -> &CefView {
-        self.views
-            .iter()
-            .find(|v| v.id == id)
-            .expect("The requested View id was not found")
+    fn find_view(&self, id: ViewId) -> Option<&CefView> {
+        self.views.iter().find(|v| v.id == id)
     }
 
-    fn find_view_mut(&mut self, id: ViewId) -> &mut CefView {
-        self.views
-            .iter_mut()
-            .find(|v| v.id == id)
-            .expect("The requested View id was not found")
+    fn find_view_mut(&mut self, id: ViewId) -> Option<&mut CefView> {
+        self.views.iter_mut().find(|v| v.id == id)
     }
 }
 
@@ -409,6 +420,11 @@ impl Engine for Cef {
         let h = size.height.max(1);
         let size = Size::new(w, h);
 
+        if !self.initialized {
+            eprintln!("iced_webview: CEF not initialized, returning blank view (no browser)");
+            return id;
+        }
+
         let shared = Rc::new(RefCell::new(SharedState {
             frame_buffer: None,
             url: None,
@@ -435,25 +451,25 @@ impl Engine for Cef {
             _ => String::new(),
         };
 
-        let initial_url: CefString = match &content {
-            Some(PageType::Url(u)) => CefString::from(u.as_str()),
-            Some(PageType::Html(html)) => {
-                let data_url =
-                    format!("data:text/html;charset=utf-8,{}", urlencoding::encode(html));
-                CefString::from(data_url.as_str())
-            }
-            None => CefString::from("about:blank"),
-        };
+        // Create the browser with about:blank first, then navigate to
+        // the actual content. This avoids issues with long data URLs
+        // during initial browser creation.
+        let initial_url = CefString::from("about:blank");
 
-        let browser = browser_host_create_browser_sync(
+        let browser = match browser_host_create_browser_sync(
             Some(&window_info),
             Some(&mut client),
             Some(&initial_url),
             Some(&browser_settings),
             None,
             None,
-        )
-        .expect("CEF browser creation failed");
+        ) {
+            Some(b) => b,
+            None => {
+                eprintln!("iced_webview: CEF browser_host_create_browser_sync returned None");
+                return id;
+            }
+        };
 
         let view = CefView {
             id,
@@ -467,6 +483,12 @@ impl Engine for Cef {
             size,
         };
         self.views.push(view);
+
+        // Navigate to the actual content now that the browser exists.
+        if let Some(page_type) = content {
+            self.goto(id, page_type);
+        }
+
         id
     }
 
@@ -534,7 +556,9 @@ impl Engine for Cef {
     }
 
     fn handle_keyboard_event(&mut self, id: ViewId, event: keyboard::Event) {
-        let view = self.find_view_mut(id);
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
         if let Some(host) = view.browser.host() {
             if let Some(ke) = iced_keyboard_to_cef(event) {
                 host.send_key_event(Some(&ke));
@@ -543,7 +567,9 @@ impl Engine for Cef {
     }
 
     fn handle_mouse_event(&mut self, id: ViewId, point: Point, event: mouse::Event) {
-        let view = self.find_view_mut(id);
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
         let Some(host) = view.browser.host() else {
             return;
         };
@@ -580,7 +606,9 @@ impl Engine for Cef {
     }
 
     fn scroll(&mut self, id: ViewId, delta: mouse::ScrollDelta) {
-        let view = self.find_view_mut(id);
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
         let Some(host) = view.browser.host() else {
             return;
         };
@@ -600,7 +628,9 @@ impl Engine for Cef {
     }
 
     fn goto(&mut self, id: ViewId, page_type: PageType) {
-        let view = self.find_view_mut(id);
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
         let Some(frame) = view.browser.main_frame() else {
             return;
         };
@@ -623,19 +653,27 @@ impl Engine for Cef {
     }
 
     fn refresh(&mut self, id: ViewId) {
-        self.find_view(id).browser.reload();
+        if let Some(view) = self.find_view(id) {
+            view.browser.reload();
+        }
     }
 
     fn go_forward(&mut self, id: ViewId) {
-        self.find_view(id).browser.go_forward();
+        if let Some(view) = self.find_view(id) {
+            view.browser.go_forward();
+        }
     }
 
     fn go_back(&mut self, id: ViewId) {
-        self.find_view(id).browser.go_back();
+        if let Some(view) = self.find_view(id) {
+            view.browser.go_back();
+        }
     }
 
     fn get_url(&self, id: ViewId) -> String {
-        let view = self.find_view(id);
+        let Some(view) = self.find_view(id) else {
+            return "about:blank".to_string();
+        };
         if let Some(frame) = view.browser.main_frame() {
             let url_userfree = frame.url();
             let url_cef: CefString = CefString::from(&url_userfree);
@@ -652,15 +690,21 @@ impl Engine for Cef {
     }
 
     fn get_title(&self, id: ViewId) -> String {
-        self.find_view(id).title.clone()
+        self.find_view(id)
+            .map(|v| v.title.clone())
+            .unwrap_or_default()
     }
 
     fn get_cursor(&self, id: ViewId) -> Interaction {
-        self.find_view(id).cursor
+        self.find_view(id)
+            .map(|v| v.cursor)
+            .unwrap_or(Interaction::Idle)
     }
 
     fn get_view(&self, id: ViewId) -> &ImageInfo {
-        &self.find_view(id).last_frame
+        static BLANK: std::sync::LazyLock<ImageInfo> =
+            std::sync::LazyLock::new(|| ImageInfo::blank(1, 1));
+        self.find_view(id).map(|v| &v.last_frame).unwrap_or(&BLANK)
     }
 }
 

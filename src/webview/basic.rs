@@ -255,6 +255,10 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     self.view_ids.push(id);
                 }
 
+                // Auto-select the newly created view so that view() and
+                // subsequent actions don't panic on a missing index.
+                self.current_view_index = Some(self.view_ids.len() - 1);
+
                 if let Some(on_view_create) = &self.on_create_view {
                     tasks.push(Task::done(on_view_create.clone()))
                 }
