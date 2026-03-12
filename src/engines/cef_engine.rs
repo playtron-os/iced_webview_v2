@@ -718,6 +718,27 @@ impl Engine for Cef {
     }
 }
 
+impl Drop for Cef {
+    fn drop(&mut self) {
+        // Close all open browsers so CEF subprocesses can exit cleanly.
+        for view in &self.views {
+            if let Some(host) = view.browser.host() {
+                host.close_browser(1);
+            }
+        }
+        self.views.clear();
+
+        if self.initialized {
+            // Pump the message loop a few times to let close events propagate
+            // to subprocesses before tearing down.
+            for _ in 0..10 {
+                do_message_loop_work();
+            }
+            shutdown();
+        }
+    }
+}
+
 fn iced_button_to_cef(button: mouse::Button) -> Option<MouseButtonType> {
     match button {
         mouse::Button::Left => Some(MouseButtonType::LEFT),
