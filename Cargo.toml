@@ -44,7 +44,7 @@ cef = ["dep:cef", "dep:urlencoding", "dep:libc", "iced/wgpu"]
 docs_only = []
 
 [dependencies]
-iced = { git = "https://github.com/playtron-os/iced.git", rev = "e669cf46", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
+iced = { git = "https://github.com/playtron-os/iced.git", rev = "b311b571", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
 #iced = { path = "../iced", default-features = false, features = ["advanced", "image", "tokio", "lazy", "wayland", "x11"] }
 rand = "0.8.5"
 litehtml = { version = "0.2.3", features = ["pixbuf", "html"], optional = true }
