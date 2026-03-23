@@ -23,6 +23,7 @@ fn main() {
                             ));
                             if cef_dir.exists() {
                                 println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cef_dir.display());
+                                strip_cef_libs(&cef_dir);
                                 break;
                             }
                         }
@@ -31,4 +32,42 @@ fn main() {
             }
         }
     }
+}
+
+/// Strip debug info and symbols from CEF shared libraries in release builds.
+/// The CEF "minimal" distribution still ships with full debug info (~1.5GB libcef.so),
+/// stripping brings it down to ~237MB.
+fn strip_cef_libs(cef_dir: &std::path::Path) {
+    let profile = std::env::var("PROFILE").unwrap_or_default();
+    if profile != "release" {
+        return;
+    }
+
+    let marker = cef_dir.join(".stripped");
+    if marker.exists() {
+        return;
+    }
+
+    let libs = ["libcef.so", "libEGL.so", "libGLESv2.so", "chrome-sandbox"];
+
+    for lib in &libs {
+        let path = cef_dir.join(lib);
+        if path.exists() {
+            let status = std::process::Command::new("strip")
+                .arg("--strip-all")
+                .arg(&path)
+                .status();
+            match status {
+                Ok(s) if s.success() => {
+                    println!("cargo:warning=Stripped {}", lib);
+                }
+                _ => {
+                    println!("cargo:warning=Failed to strip {}", lib);
+                }
+            }
+        }
+    }
+
+    // Mark as stripped so we don't re-strip on incremental builds
+    let _ = std::fs::write(&marker, "");
 }
