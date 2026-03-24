@@ -16,10 +16,13 @@ fn main() {
                     for entry in entries.flatten() {
                         let name = entry.file_name();
                         if name.to_string_lossy().starts_with("cef-dll-sys-") {
+                            // Use TARGET arch, not HOST arch, for cross-compilation
+                            let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH")
+                                .unwrap_or_else(|_| std::env::consts::ARCH.to_string());
                             let cef_dir = entry.path().join("out").join(format!(
                                 "cef_{}_{}",
                                 std::env::consts::OS,
-                                std::env::consts::ARCH
+                                target_arch
                             ));
                             if cef_dir.exists() {
                                 println!("cargo:rustc-link-arg=-Wl,-rpath,{}", cef_dir.display());
@@ -48,12 +51,20 @@ fn strip_cef_libs(cef_dir: &std::path::Path) {
         return;
     }
 
+    // Use the appropriate strip for cross-compilation
+    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let strip_cmd = if target_arch == "aarch64" {
+        "aarch64-linux-gnu-strip"
+    } else {
+        "strip"
+    };
+
     let libs = ["libcef.so", "libEGL.so", "libGLESv2.so", "chrome-sandbox"];
 
     for lib in &libs {
         let path = cef_dir.join(lib);
         if path.exists() {
-            let status = std::process::Command::new("strip")
+            let status = std::process::Command::new(strip_cmd)
                 .arg("--strip-all")
                 .arg(&path)
                 .status();
