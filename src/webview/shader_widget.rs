@@ -38,6 +38,8 @@ impl<'a> WebViewShaderProgram<'a> {
 #[derive(Default)]
 pub struct ShaderState {
     bounds: Size<u32>,
+    /// Whether the webview has keyboard focus (user clicked inside it).
+    focused: bool,
 }
 
 pub struct WebViewPrimitive {
@@ -333,6 +335,12 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
 
         match event {
             Event::Keyboard(event) => {
+                // Only forward keyboard events when the webview is focused
+                // (user clicked inside it). This prevents keystrokes meant
+                // for the chat input from also reaching the webview.
+                if !state.focused {
+                    return None;
+                }
                 if let keyboard::Event::KeyPressed {
                     key: keyboard::Key::Character(c),
                     modifiers,
@@ -348,6 +356,10 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                 )))
             }
             Event::Mouse(event) => {
+                // Track focus: clicking inside grants focus, clicking outside loses it.
+                if matches!(event, mouse::Event::ButtonPressed(_)) {
+                    state.focused = cursor.position_in(bounds).is_some();
+                }
                 if let Some(point) = cursor.position_in(bounds) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
                         *event, point,
@@ -383,10 +395,14 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
     fn mouse_interaction(
         &self,
         _state: &Self::State,
-        _bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
     ) -> Interaction {
-        self.cursor
+        if cursor.position_in(bounds).is_some() {
+            self.cursor
+        } else {
+            Interaction::None
+        }
     }
 }
 

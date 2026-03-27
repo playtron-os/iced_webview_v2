@@ -40,6 +40,12 @@ pub enum Action {
     Resize(Size<u32>),
     /// Copy the current text selection to clipboard
     CopySelection,
+    /// Suspend the current view — close its browser but keep the engine alive.
+    /// The view ID is preserved for later `Resume`.
+    Suspend,
+    /// Resume the current (suspended) view, recreating its browser with the
+    /// given content.
+    Resume(PageType),
     /// Internal: carries the result of a URL fetch for engines without native URL support.
     /// On success returns `(html, css_cache)`.
     FetchComplete(
@@ -439,6 +445,18 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     }
                 }
                 return Task::batch(tasks);
+            }
+            Action::Suspend => {
+                if self.current_view_index.is_some() {
+                    let id = self.get_current_view_id();
+                    self.engine.suspend_view(id);
+                }
+            }
+            Action::Resume(content) => {
+                if self.current_view_index.is_some() {
+                    let id = self.get_current_view_id();
+                    self.engine.resume_view(id, self.view_size, Some(content));
+                }
             }
             Action::FetchComplete(view_id, url, result) => {
                 if !self.engine.has_view(view_id) {

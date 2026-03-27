@@ -69,6 +69,15 @@ pub trait Engine {
         false
     }
 
+    /// Suspend a view — release its browser resources but keep the view ID
+    /// reserved and the engine alive. Call `resume_view` to recreate the
+    /// browser later. No-op on engines without expensive per-view resources.
+    fn suspend_view(&mut self, _id: ViewId) {}
+
+    /// Resume a previously suspended view, recreating its browser with the
+    /// given content and size. No-op if the view was not suspended.
+    fn resume_view(&mut self, _id: ViewId, _size: Size<u32>, _content: Option<PageType>) {}
+
     /// Focuses webview
     fn focus(&mut self);
     /// Unfocuses webview

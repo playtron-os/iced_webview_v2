@@ -193,6 +193,13 @@ struct CefView {
     size: Size<u32>,
 }
 
+/// Minimal state kept for a suspended view so it can be resumed later
+/// without tearing down the entire CEF engine.
+struct ParkedView {
+    id: ViewId,
+    last_frame: ImageInfo,
+}
+
 /// Full browser engine backed by [CEF/Chromium](https://github.com/tauri-apps/cef-rs)
 /// (HTML5, CSS3, JS).
 ///
@@ -221,6 +228,7 @@ struct CefView {
 /// ```
 pub struct Cef {
     views: Vec<CefView>,
+    parked_views: Vec<ParkedView>,
     scale_factor: f32,
     initialized: bool,
 }
@@ -292,6 +300,7 @@ impl Default for Cef {
 
         Self {
             views: Vec::new(),
+            parked_views: Vec::new(),
             scale_factor: 1.0,
             initialized,
         }
@@ -359,6 +368,66 @@ impl Cef {
     fn find_view_mut(&mut self, id: ViewId) -> Option<&mut CefView> {
         self.views.iter_mut().find(|v| v.id == id)
     }
+
+    /// Create a browser and its CefView, returning None if CEF isn't
+    /// initialized or browser creation fails. Optionally reuses a previous
+    /// frame so the view doesn't flash to blank on resume.
+    fn create_browser_view(
+        &self,
+        id: ViewId,
+        size: Size<u32>,
+        last_frame: Option<ImageInfo>,
+    ) -> Option<CefView> {
+        if !self.initialized {
+            return None;
+        }
+
+        let w = size.width.max(1);
+        let h = size.height.max(1);
+        let size = Size::new(w, h);
+
+        let shared = Rc::new(RefCell::new(SharedState {
+            frame_buffer: None,
+            url: None,
+            title: None,
+            cursor_type: CursorType::POINTER,
+            size,
+            scale_factor: self.scale_factor,
+        }));
+
+        let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
+        let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
+        let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
+        let mut client = OsrClient::new(render_handler, display_handler, life_span_handler);
+
+        let window_info = WindowInfo::default().set_as_windowless(0);
+        let browser_settings = BrowserSettings {
+            windowless_frame_rate: 60,
+            ..Default::default()
+        };
+
+        let initial_url = CefString::from("about:blank");
+        let browser = browser_host_create_browser_sync(
+            Some(&window_info),
+            Some(&mut client),
+            Some(&initial_url),
+            Some(&browser_settings),
+            None,
+            None,
+        )?;
+
+        Some(CefView {
+            id,
+            browser,
+            shared,
+            url: String::new(),
+            title: String::new(),
+            cursor: Interaction::Idle,
+            last_frame: last_frame.unwrap_or_else(|| ImageInfo::blank(w, h)),
+            needs_render: true,
+            size,
+        })
+    }
 }
 
 fn cursor_type_to_interaction(cursor: CursorType) -> Interaction {
@@ -406,10 +475,10 @@ impl Engine for Cef {
                 let elapsed = t0.elapsed();
                 if elapsed.as_millis() > 2 {
                     eprintln!(
-                        "[cef] new frame {}x{} in {}µs (slow)",
+                        "[cef] slow frame {}×{} took {}ms",
                         w,
                         h,
-                        elapsed.as_micros()
+                        elapsed.as_millis()
                     );
                 }
             }
@@ -433,77 +502,12 @@ impl Engine for Cef {
 
     fn new_view(&mut self, size: Size<u32>, content: Option<PageType>) -> ViewId {
         let id = rand::thread_rng().gen();
-        let w = size.width.max(1);
-        let h = size.height.max(1);
-        let size = Size::new(w, h);
 
-        if !self.initialized {
-            eprintln!("iced_webview: CEF not initialized, returning blank view (no browser)");
-            return id;
-        }
-
-        let shared = Rc::new(RefCell::new(SharedState {
-            frame_buffer: None,
-            url: None,
-            title: None,
-            cursor_type: CursorType::POINTER,
-            size,
-            scale_factor: self.scale_factor,
-        }));
-
-        let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
-        let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
-        let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
-        let mut client = OsrClient::new(render_handler, display_handler, life_span_handler);
-
-        let window_info = WindowInfo::default().set_as_windowless(0);
-
-        let browser_settings = BrowserSettings {
-            windowless_frame_rate: 60,
-            ..Default::default()
-        };
-
-        let url_str = match &content {
-            Some(PageType::Url(u)) => u.clone(),
-            _ => String::new(),
-        };
-
-        // Create the browser with about:blank first, then navigate to
-        // the actual content. This avoids issues with long data URLs
-        // during initial browser creation.
-        let initial_url = CefString::from("about:blank");
-
-        let browser = match browser_host_create_browser_sync(
-            Some(&window_info),
-            Some(&mut client),
-            Some(&initial_url),
-            Some(&browser_settings),
-            None,
-            None,
-        ) {
-            Some(b) => b,
-            None => {
-                eprintln!("iced_webview: CEF browser_host_create_browser_sync returned None");
-                return id;
+        if let Some(view) = self.create_browser_view(id, size, None) {
+            self.views.push(view);
+            if let Some(page_type) = content {
+                self.goto(id, page_type);
             }
-        };
-
-        let view = CefView {
-            id,
-            browser,
-            shared,
-            url: url_str,
-            title: String::new(),
-            cursor: Interaction::Idle,
-            last_frame: ImageInfo::blank(w, h),
-            needs_render: true,
-            size,
-        };
-        self.views.push(view);
-
-        // Navigate to the actual content now that the browser exists.
-        if let Some(page_type) = content {
-            self.goto(id, page_type);
         }
 
         id
@@ -520,7 +524,36 @@ impl Engine for Cef {
     }
 
     fn has_view(&self, id: ViewId) -> bool {
-        self.views.iter().any(|v| v.id == id)
+        self.views.iter().any(|v| v.id == id) || self.parked_views.iter().any(|v| v.id == id)
+    }
+
+    fn suspend_view(&mut self, id: ViewId) {
+        if let Some(pos) = self.views.iter().position(|v| v.id == id) {
+            let view = self.views.remove(pos);
+            let parked = ParkedView {
+                id: view.id,
+                last_frame: view.last_frame,
+            };
+            if let Some(host) = view.browser.host() {
+                host.close_browser(1);
+            }
+            self.parked_views.push(parked);
+        }
+    }
+
+    fn resume_view(&mut self, id: ViewId, size: Size<u32>, content: Option<PageType>) {
+        let last_frame = if let Some(pos) = self.parked_views.iter().position(|v| v.id == id) {
+            Some(self.parked_views.remove(pos).last_frame)
+        } else {
+            None
+        };
+
+        if let Some(view) = self.create_browser_view(id, size, last_frame) {
+            self.views.push(view);
+            if let Some(page_type) = content {
+                self.goto(id, page_type);
+            }
+        }
     }
 
     fn view_ids(&self) -> Vec<ViewId> {
@@ -721,7 +754,15 @@ impl Engine for Cef {
     fn get_view(&self, id: ViewId) -> &ImageInfo {
         static BLANK: std::sync::LazyLock<ImageInfo> =
             std::sync::LazyLock::new(|| ImageInfo::blank(1, 1));
-        self.find_view(id).map(|v| &v.last_frame).unwrap_or(&BLANK)
+        self.find_view(id)
+            .map(|v| &v.last_frame)
+            .or_else(|| {
+                self.parked_views
+                    .iter()
+                    .find(|v| v.id == id)
+                    .map(|v| &v.last_frame)
+            })
+            .unwrap_or(&BLANK)
     }
 }
 
