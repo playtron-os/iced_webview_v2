@@ -649,10 +649,16 @@ impl Engine for Litehtml {
         // No-op: litehtml has no keyboard interaction.
     }
 
-    fn handle_mouse_event(&mut self, id: ViewId, point: Point, event: mouse::Event) {
+    fn handle_mouse_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: mouse::Event,
+        _modifiers: keyboard::Modifiers,
+    ) {
         match event {
             mouse::Event::WheelScrolled { delta } => {
-                self.scroll(id, delta);
+                self.scroll(id, point, delta);
             }
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let view = self.find_view_mut(id);
@@ -737,7 +743,7 @@ impl Engine for Litehtml {
         }
     }
 
-    fn scroll(&mut self, id: ViewId, delta: mouse::ScrollDelta) {
+    fn scroll(&mut self, id: ViewId, _point: Point, delta: mouse::ScrollDelta) {
         let view = self.find_view_mut(id);
         match delta {
             mouse::ScrollDelta::Lines { y, .. } => {

@@ -40,6 +40,12 @@ pub struct ShaderState {
     bounds: Size<u32>,
     /// Whether the webview has keyboard focus (user clicked inside it).
     focused: bool,
+    /// Current keyboard modifier state (shift, ctrl, alt).
+    modifiers: keyboard::Modifiers,
+    /// Mouse button held inside the webview — continue forwarding events
+    /// even when the cursor leaves the widget bounds (scrollbar drag, text
+    /// selection, etc.).
+    dragging: bool,
 }
 
 pub struct WebViewPrimitive {
@@ -218,8 +224,8 @@ impl shader::Pipeline for WebViewPipeline {
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("webview_sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -335,6 +341,16 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
 
         match event {
             Event::Keyboard(event) => {
+                // Track modifier state from all keyboard events.
+                match event {
+                    keyboard::Event::KeyPressed { modifiers, .. }
+                    | keyboard::Event::KeyReleased { modifiers, .. } => {
+                        state.modifiers = *modifiers;
+                    }
+                    keyboard::Event::ModifiersChanged(modifiers) => {
+                        state.modifiers = *modifiers;
+                    }
+                }
                 // Only forward keyboard events when the webview is focused
                 // (user clicked inside it). This prevents keystrokes meant
                 // for the chat input from also reaching the webview.
@@ -358,16 +374,44 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
             Event::Mouse(event) => {
                 // Track focus: clicking inside grants focus, clicking outside loses it.
                 if matches!(event, mouse::Event::ButtonPressed(_)) {
-                    state.focused = cursor.position_in(bounds).is_some();
+                    let inside = cursor.position_in(bounds).is_some();
+                    state.focused = inside;
+                    if inside {
+                        state.dragging = true;
+                    }
                 }
+                if matches!(event, mouse::Event::ButtonReleased(_)) {
+                    state.dragging = false;
+                }
+
                 if let Some(point) = cursor.position_in(bounds) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
-                        *event, point,
+                        *event,
+                        point,
+                        state.modifiers,
                     )))
+                } else if state.dragging {
+                    // Mouse captured: button was pressed inside and is still
+                    // held. Clamp coordinates to bounds so CEF continues
+                    // receiving drag events (scrollbar drag, text selection).
+                    if let Some(pos) = cursor.position() {
+                        let clamped = Point::new(
+                            (pos.x - bounds.x).clamp(0.0, bounds.width),
+                            (pos.y - bounds.y).clamp(0.0, bounds.height),
+                        );
+                        Some(shader::Action::publish(Action::SendMouseEvent(
+                            *event,
+                            clamped,
+                            state.modifiers,
+                        )))
+                    } else {
+                        None
+                    }
                 } else if matches!(event, mouse::Event::CursorLeft) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
                         *event,
                         Point::ORIGIN,
+                        state.modifiers,
                     )))
                 } else {
                     None

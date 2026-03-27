@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::os::raw::c_int;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use iced::keyboard;
 use iced::mouse::{self, Interaction};
@@ -19,7 +20,14 @@ use cef::*;
 /// Shared mutable state populated by CEF handler callbacks and drained
 /// each `update()` tick.
 struct SharedState {
-    frame_buffer: Option<(Vec<u8>, u32, u32)>,
+    /// New frame ready for consumption by `update()`. The `Arc` is shared
+    /// with the shader pipeline so no copy is needed.
+    frame_buffer: Option<(Arc<Vec<u8>>, u32, u32)>,
+    /// Persistent pixel buffer reused across on_paint calls. Dirty rects
+    /// are blitted into it via `Arc::make_mut` (copy-on-write: only copies
+    /// if the shader still holds a reference to the previous frame).
+    persistent_buffer: Arc<Vec<u8>>,
+    persistent_size: (u32, u32),
     url: Option<String>,
     title: Option<String>,
     cursor_type: CursorType,
@@ -47,10 +55,12 @@ wrap_app! {
                     Some(&CefString::from("headless")),
                 );
 
-                // OSR delivers pixels via on_paint() — GPU compositing
-                // inside CEF isn't needed. Disable it and run any
-                // remaining GL calls in-process so the GPU subprocess
-                // doesn't need real driver access (containers, Flatpak).
+                // OSR delivers pixels via on_paint(). GPU compositing
+                // inside CEF requires its own GL context, which conflicts
+                // with the host iced app's wgpu context on X11 (GLX
+                // BadMatch). Disable it and run remaining GL calls
+                // in-process so the GPU subprocess doesn't need real
+                // driver access (containers, Flatpak).
                 cmd.append_switch(Some(&CefString::from("disable-gpu")));
                 cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
                 cmd.append_switch(Some(&CefString::from("in-process-gpu")));
@@ -94,16 +104,47 @@ wrap_render_handler! {
             &self,
             _browser: Option<&mut Browser>,
             _type_: PaintElementType,
-            _dirty_rects: Option<&[Rect]>,
+            dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
             width: c_int,
             height: c_int,
         ) {
-            let w = width as usize;
-            let h = height as usize;
-            let len = w * h * 4;
-            let pixels = unsafe { std::slice::from_raw_parts(buffer, len) }.to_vec();
-            self.shared.borrow_mut().frame_buffer = Some((pixels, width as u32, height as u32));
+            let w = width as u32;
+            let h = height as u32;
+            let stride = (w as usize) * 4;
+            let total = stride * h as usize;
+            let src = unsafe { std::slice::from_raw_parts(buffer, total) };
+
+            let mut shared = self.shared.borrow_mut();
+
+            // Resize persistent buffer when dimensions change.
+            if shared.persistent_size != (w, h) {
+                shared.persistent_buffer = Arc::new(src.to_vec());
+                shared.persistent_size = (w, h);
+            } else if let Some(rects) = dirty_rects {
+                // Copy only dirty regions. `Arc::make_mut` gives us
+                // exclusive write access — if the shader still holds a
+                // reference to the previous frame, this triggers a CoW
+                // copy; otherwise we mutate in-place with zero allocation.
+                let dst = Arc::make_mut(&mut shared.persistent_buffer);
+                for rect in rects {
+                    let rx = (rect.x as usize).min(w as usize);
+                    let ry = (rect.y as usize).min(h as usize);
+                    let rw = (rect.width as usize).min(w as usize - rx);
+                    let rh = (rect.height as usize).min(h as usize - ry);
+                    for row in 0..rh {
+                        let y = ry + row;
+                        let offset = y * stride + rx * 4;
+                        let len = rw * 4;
+                        dst[offset..offset + len].copy_from_slice(&src[offset..offset + len]);
+                    }
+                }
+            } else {
+                // No dirty rects — full copy fallback.
+                Arc::make_mut(&mut shared.persistent_buffer).copy_from_slice(src);
+            }
+
+            shared.frame_buffer = Some((Arc::clone(&shared.persistent_buffer), w, h));
         }
     }
 }
@@ -191,6 +232,11 @@ struct CefView {
     last_frame: ImageInfo,
     needs_render: bool,
     size: Size<u32>,
+    /// Last click position + timestamp for multi-click detection.
+    last_click: Option<(Point, std::time::Instant)>,
+    click_count: c_int,
+    /// CEF event-flag bitmask for currently held mouse buttons.
+    pressed_buttons: u32,
 }
 
 /// Minimal state kept for a suspended view so it can be resumed later
@@ -388,6 +434,8 @@ impl Cef {
 
         let shared = Rc::new(RefCell::new(SharedState {
             frame_buffer: None,
+            persistent_buffer: Arc::new(Vec::new()),
+            persistent_size: (0, 0),
             url: None,
             title: None,
             cursor_type: CursorType::POINTER,
@@ -426,6 +474,9 @@ impl Cef {
             last_frame: last_frame.unwrap_or_else(|| ImageInfo::blank(w, h)),
             needs_render: true,
             size,
+            last_click: None,
+            click_count: 0,
+            pressed_buttons: 0,
         })
     }
 }
@@ -470,7 +521,7 @@ impl Engine for Cef {
 
             if let Some((pixels, w, h)) = shared.frame_buffer.take() {
                 let t0 = std::time::Instant::now();
-                view.last_frame = ImageInfo::new(pixels, PixelFormat::Bgra, w, h);
+                view.last_frame = ImageInfo::from_arc(pixels, PixelFormat::Bgra, w, h);
                 view.needs_render = false;
                 let elapsed = t0.elapsed();
                 if elapsed.as_millis() > 2 {
@@ -616,7 +667,92 @@ impl Engine for Cef {
         }
     }
 
-    fn handle_mouse_event(&mut self, id: ViewId, point: Point, event: mouse::Event) {
+    fn handle_mouse_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: mouse::Event,
+        modifiers: keyboard::Modifiers,
+    ) {
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
+        let Some(host) = view.browser.host() else {
+            return;
+        };
+
+        let cef_modifiers = iced_modifiers_to_cef(modifiers) | view.pressed_buttons;
+
+        match event {
+            mouse::Event::ButtonPressed(button) => {
+                // Set the button flag *before* building MouseEvent so the
+                // press itself already carries the held-button flag.
+                view.pressed_buttons |= mouse_button_event_flag(button);
+                let cef_modifiers = cef_modifiers | view.pressed_buttons;
+                let me = MouseEvent {
+                    x: point.x as c_int,
+                    y: point.y as c_int,
+                    modifiers: cef_modifiers,
+                };
+                // Multi-click detection: same button within 500ms and 4px radius
+                let now = std::time::Instant::now();
+                let is_repeat = view
+                    .last_click
+                    .as_ref()
+                    .is_some_and(|(prev_pt, prev_time)| {
+                        now.duration_since(*prev_time).as_millis() < 500
+                            && (point.x - prev_pt.x).abs() < 4.0
+                            && (point.y - prev_pt.y).abs() < 4.0
+                    });
+                view.click_count = if is_repeat {
+                    (view.click_count % 3) + 1 // cycle 1 → 2 → 3 → 1
+                } else {
+                    1
+                };
+                view.last_click = Some((point, now));
+
+                if let Some(cef_btn) = iced_button_to_cef(button) {
+                    host.send_mouse_click_event(Some(&me), cef_btn, 0, view.click_count);
+                }
+            }
+            mouse::Event::ButtonReleased(button) => {
+                // Clear the button flag *after* sending the release event
+                // so the release itself still carries the button flag.
+                let me = MouseEvent {
+                    x: point.x as c_int,
+                    y: point.y as c_int,
+                    modifiers: cef_modifiers,
+                };
+                if let Some(cef_btn) = iced_button_to_cef(button) {
+                    host.send_mouse_click_event(Some(&me), cef_btn, 1, view.click_count.max(1));
+                }
+                view.pressed_buttons &= !mouse_button_event_flag(button);
+            }
+            mouse::Event::CursorMoved { .. } => {
+                let me = MouseEvent {
+                    x: point.x as c_int,
+                    y: point.y as c_int,
+                    modifiers: cef_modifiers,
+                };
+                host.send_mouse_move_event(Some(&me), 0);
+            }
+            mouse::Event::WheelScrolled { delta } => {
+                drop(host);
+                self.scroll(id, point, delta);
+            }
+            mouse::Event::CursorLeft => {
+                let me = MouseEvent {
+                    x: point.x as c_int,
+                    y: point.y as c_int,
+                    modifiers: cef_modifiers,
+                };
+                host.send_mouse_move_event(Some(&me), 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn scroll(&mut self, id: ViewId, point: Point, delta: mouse::ScrollDelta) {
         let Some(view) = self.find_view_mut(id) else {
             return;
         };
@@ -630,47 +766,8 @@ impl Engine for Cef {
             modifiers: 0,
         };
 
-        match event {
-            mouse::Event::ButtonPressed(button) => {
-                if let Some(cef_btn) = iced_button_to_cef(button) {
-                    host.send_mouse_click_event(Some(&me), cef_btn, 0, 1);
-                }
-            }
-            mouse::Event::ButtonReleased(button) => {
-                if let Some(cef_btn) = iced_button_to_cef(button) {
-                    host.send_mouse_click_event(Some(&me), cef_btn, 1, 1);
-                }
-            }
-            mouse::Event::CursorMoved { .. } => {
-                host.send_mouse_move_event(Some(&me), 0);
-            }
-            mouse::Event::WheelScrolled { delta } => {
-                drop(host);
-                self.scroll(id, delta);
-            }
-            mouse::Event::CursorLeft => {
-                host.send_mouse_move_event(Some(&me), 1);
-            }
-            _ => {}
-        }
-    }
-
-    fn scroll(&mut self, id: ViewId, delta: mouse::ScrollDelta) {
-        let Some(view) = self.find_view_mut(id) else {
-            return;
-        };
-        let Some(host) = view.browser.host() else {
-            return;
-        };
-
-        let me = MouseEvent {
-            x: 0,
-            y: 0,
-            modifiers: 0,
-        };
-
         let (dx, dy) = match delta {
-            mouse::ScrollDelta::Lines { x, y } => ((x * 40.0) as c_int, (y * 40.0) as c_int),
+            mouse::ScrollDelta::Lines { x, y } => ((x * 53.0) as c_int, (y * 53.0) as c_int),
             mouse::ScrollDelta::Pixels { x, y } => (x as c_int, y as c_int),
         };
 
@@ -794,6 +891,31 @@ fn iced_button_to_cef(button: mouse::Button) -> Option<MouseButtonType> {
         mouse::Button::Right => Some(MouseButtonType::RIGHT),
         _ => None,
     }
+}
+
+/// Return the CEF event-flag bit for a held mouse button.
+fn mouse_button_event_flag(button: mouse::Button) -> u32 {
+    match button {
+        mouse::Button::Left => 32,   // EVENTFLAG_LEFT_MOUSE_BUTTON
+        mouse::Button::Middle => 64, // EVENTFLAG_MIDDLE_MOUSE_BUTTON
+        mouse::Button::Right => 128, // EVENTFLAG_RIGHT_MOUSE_BUTTON
+        _ => 0,
+    }
+}
+
+/// Convert iced keyboard modifiers to CEF event flag bitmask.
+fn iced_modifiers_to_cef(modifiers: keyboard::Modifiers) -> u32 {
+    let mut flags: u32 = 0;
+    if modifiers.shift() {
+        flags |= 2; // EVENTFLAG_SHIFT_DOWN
+    }
+    if modifiers.control() {
+        flags |= 4; // EVENTFLAG_CONTROL_DOWN
+    }
+    if modifiers.alt() {
+        flags |= 8; // EVENTFLAG_ALT_DOWN
+    }
+    flags
 }
 
 fn iced_keyboard_to_cef(event: keyboard::Event) -> Option<KeyEvent> {

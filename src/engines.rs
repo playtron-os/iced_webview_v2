@@ -96,9 +96,15 @@ pub trait Engine {
     /// lets the engine handle keyboard events
     fn handle_keyboard_event(&mut self, id: ViewId, event: keyboard::Event);
     /// lets the engine handle mouse events
-    fn handle_mouse_event(&mut self, id: ViewId, point: Point, event: mouse::Event);
+    fn handle_mouse_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: mouse::Event,
+        modifiers: keyboard::Modifiers,
+    );
     /// Handles scrolling on view
-    fn scroll(&mut self, id: ViewId, delta: mouse::ScrollDelta);
+    fn scroll(&mut self, id: ViewId, point: Point, delta: mouse::ScrollDelta);
 
     /// Go to a specific page type
     fn goto(&mut self, id: ViewId, page_type: PageType);

@@ -34,7 +34,7 @@ pub enum Action {
     GoToUrl(Url),
     Refresh,
     SendKeyboardEvent(keyboard::Event),
-    SendMouseEvent(mouse::Event, Point),
+    SendMouseEvent(mouse::Event, Point, keyboard::Modifiers),
     /// Allows users to control when the browser engine proccesses interactions in subscriptions
     Update,
     Resize(Size<u32>),
@@ -331,9 +331,10 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 self.engine
                     .handle_keyboard_event(self.get_current_view_id(), event);
             }
-            Action::SendMouseEvent(event, point) => {
+            Action::SendMouseEvent(event, point, modifiers) => {
                 let view_id = self.get_current_view_id();
-                self.engine.handle_mouse_event(view_id, point, event);
+                self.engine
+                    .handle_mouse_event(view_id, point, event, modifiers);
 
                 // Check if the click triggered an anchor navigation
                 if let Some(href) = self.engine.take_anchor_click(view_id) {
@@ -708,9 +709,17 @@ where
             }
             Event::Mouse(event) => {
                 if let Some(point) = cursor.position_in(layout.bounds()) {
-                    shell.publish(Action::SendMouseEvent(*event, point));
+                    shell.publish(Action::SendMouseEvent(
+                        *event,
+                        point,
+                        keyboard::Modifiers::empty(),
+                    ));
                 } else if matches!(event, mouse::Event::CursorLeft) {
-                    shell.publish(Action::SendMouseEvent(*event, Point::ORIGIN));
+                    shell.publish(Action::SendMouseEvent(
+                        *event,
+                        Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
+                    ));
                 }
             }
             _ => (),

@@ -88,15 +88,19 @@ impl ImageInfo {
     const HEIGHT: u32 = 800;
 
     fn new(pixels: Vec<u8>, format: PixelFormat, width: u32, height: u32) -> Self {
+        Self::from_arc(Arc::new(pixels), format, width, height)
+    }
+
+    /// Create from a pre-shared pixel buffer, avoiding an extra allocation.
+    fn from_arc(raw_pixels: Arc<Vec<u8>>, format: PixelFormat, width: u32, height: u32) -> Self {
         // R, G, B, A
-        assert_eq!(pixels.len() % 4, 0);
+        assert_eq!(raw_pixels.len() % 4, 0);
 
         // Store pixels in their native format — no CPU swizzle.
         // The shader path picks the matching GPU texture format
         // (Bgra8UnormSrgb vs Rgba8UnormSrgb) so the GPU handles
         // channel reordering for free.
         // The Handle path (as_handle()) swizzles lazily on first call.
-        let raw_pixels = Arc::new(pixels);
         Self {
             width,
             height,

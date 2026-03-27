@@ -32,7 +32,7 @@ pub enum Action {
     GoToUrl(ViewId, Url),
     Refresh(ViewId),
     SendKeyboardEvent(ViewId, keyboard::Event),
-    SendMouseEvent(ViewId, mouse::Event, Point),
+    SendMouseEvent(ViewId, mouse::Event, Point, keyboard::Modifiers),
     /// Call this periodically to update a view
     Update(ViewId),
     /// Call this periodically to update a view(s)
@@ -286,8 +286,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 self.engine.handle_keyboard_event(id, event);
                 self.engine.request_render(id, self.view_size);
             }
-            Action::SendMouseEvent(id, event, point) => {
-                self.engine.handle_mouse_event(id, point, event);
+            Action::SendMouseEvent(id, event, point, modifiers) => {
+                self.engine.handle_mouse_event(id, point, event, modifiers);
 
                 if let Some(href) = self.engine.take_anchor_click(id) {
                     let current = self.engine.get_url(id);
@@ -598,12 +598,14 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
                         self.view_id,
                         *event,
                         point,
+                        keyboard::Modifiers::empty(),
                     )))
                 } else if matches!(event, mouse::Event::CursorLeft) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
                         self.view_id,
                         *event,
                         Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
                     )))
                 } else {
                     None
@@ -780,9 +782,19 @@ where
             }
             Event::Mouse(event) => {
                 if let Some(point) = cursor.position_in(layout.bounds()) {
-                    shell.publish(Action::SendMouseEvent(self.id, *event, point));
+                    shell.publish(Action::SendMouseEvent(
+                        self.id,
+                        *event,
+                        point,
+                        keyboard::Modifiers::empty(),
+                    ));
                 } else if matches!(event, mouse::Event::CursorLeft) {
-                    shell.publish(Action::SendMouseEvent(self.id, *event, Point::ORIGIN));
+                    shell.publish(Action::SendMouseEvent(
+                        self.id,
+                        *event,
+                        Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
+                    ));
                 }
             }
             _ => (),

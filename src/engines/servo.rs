@@ -328,7 +328,13 @@ impl Engine for Servo {
         }
     }
 
-    fn handle_mouse_event(&mut self, id: ViewId, point: Point, event: mouse::Event) {
+    fn handle_mouse_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: mouse::Event,
+        _modifiers: keyboard::Modifiers,
+    ) {
         let device_point = DevicePoint::new(point.x, point.y);
         self.find_view_mut(id).last_cursor = device_point;
 
@@ -364,13 +370,13 @@ impl Engine for Servo {
                     }));
             }
             mouse::Event::WheelScrolled { delta } => {
-                self.scroll(id, delta);
+                self.scroll(id, point, delta);
             }
             _ => {}
         }
     }
 
-    fn scroll(&mut self, id: ViewId, delta: mouse::ScrollDelta) {
+    fn scroll(&mut self, id: ViewId, _point: Point, delta: mouse::ScrollDelta) {
         let view = self.find_view_mut(id);
         let (dx, dy, mode) = match delta {
             mouse::ScrollDelta::Lines { x, y } => (x as f64, y as f64, WheelMode::DeltaLine),
