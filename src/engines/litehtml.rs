@@ -192,6 +192,7 @@ impl DocumentContainer for WebviewContainer {
 /// (field drop order: `doc_state` is declared before `container`).
 struct DocumentState {
     doc: Document<'static>,
+    #[allow(clippy::type_complexity)]
     measure: Box<dyn Fn(&str, usize) -> f32>,
     selection: Selection<'static>,
 }
@@ -331,7 +332,6 @@ fn rebuild_document(view: &mut LitehtmlView) {
                 match Document::from_html(&view.html, container_ref2, None, None) {
                     Err(e) => {
                         eprintln!("litehtml: from_html pass 2 failed: {e:?}");
-                        return;
                     }
                     Ok(mut doc2) => {
                         let _ = doc2.render(w as f32);
