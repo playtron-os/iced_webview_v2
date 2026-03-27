@@ -200,11 +200,14 @@ wrap_life_span_handler! {
     }
 }
 
+use super::cef_dialog::OsrDialogHandler;
+
 wrap_client! {
     struct OsrClient {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         life_span_handler: LifeSpanHandler,
+        dialog_handler: DialogHandler,
     }
 
     impl Client {
@@ -218,6 +221,10 @@ wrap_client! {
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(self.life_span_handler.clone())
+        }
+
+        fn dialog_handler(&self) -> Option<DialogHandler> {
+            Some(self.dialog_handler.clone())
         }
     }
 }
@@ -277,6 +284,7 @@ pub struct Cef {
     parked_views: Vec<ParkedView>,
     scale_factor: f32,
     initialized: bool,
+    init_error: Option<String>,
 }
 
 impl Default for Cef {
@@ -331,11 +339,16 @@ impl Default for Cef {
         );
 
         let initialized = result == 1;
-        if !initialized {
-            eprintln!("iced_webview: CEF initialize() returned {result} (expected 1). Browser creation will be skipped.");
-            eprintln!("  cef_dir: {cef_dir_str}");
-            eprintln!("  cache: {cef_cache}");
-        }
+        let init_error = if !initialized {
+            let msg = format!(
+                "CEF initialize() returned {result} (expected 1). \
+                 cef_dir={cef_dir_str}, cache={cef_cache}"
+            );
+            log::error!("iced_webview: {msg}");
+            Some(msg)
+        } else {
+            None
+        };
 
         // CEF's initialize() installs its own signal handlers that swallow
         // SIGINT — restore the default so a single Ctrl+C terminates the app.
@@ -349,6 +362,7 @@ impl Default for Cef {
             parked_views: Vec::new(),
             scale_factor: 1.0,
             initialized,
+            init_error,
         }
     }
 }
@@ -446,7 +460,13 @@ impl Cef {
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
         let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
         let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
-        let mut client = OsrClient::new(render_handler, display_handler, life_span_handler);
+        let dialog_handler = OsrDialogHandler::new();
+        let mut client = OsrClient::new(
+            render_handler,
+            display_handler,
+            life_span_handler,
+            dialog_handler,
+        );
 
         let window_info = WindowInfo::default().set_as_windowless(0);
         let browser_settings = BrowserSettings {
@@ -860,6 +880,10 @@ impl Engine for Cef {
                     .map(|v| &v.last_frame)
             })
             .unwrap_or(&BLANK)
+    }
+
+    fn initialization_error(&self) -> Option<&str> {
+        self.init_error.as_deref()
     }
 }
 

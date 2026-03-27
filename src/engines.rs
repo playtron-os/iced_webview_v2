@@ -18,6 +18,10 @@ pub mod litehtml;
 #[cfg(feature = "servo")]
 pub mod servo;
 
+/// CEF file dialog handler (zenity-based native file picker)
+#[cfg(feature = "cef")]
+mod cef_dialog;
+
 /// A CEF/Chromium implementation of Engine (full browser via cef-rs)
 #[cfg(feature = "cef")]
 pub mod cef_engine;
@@ -190,5 +194,14 @@ pub trait Engine {
     /// Return all active view IDs.
     fn view_ids(&self) -> Vec<ViewId> {
         Vec::new()
+    }
+
+    /// Return an initialization error message, if any.
+    ///
+    /// When the engine failed to initialize (missing runtime, bad config,
+    /// etc.), this returns a human-readable error string. Consumers can
+    /// check this after construction to display a fallback UI.
+    fn initialization_error(&self) -> Option<&str> {
+        None
     }
 }
