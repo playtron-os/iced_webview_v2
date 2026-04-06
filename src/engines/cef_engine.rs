@@ -312,7 +312,22 @@ impl Default for Cef {
         // Point CEF to its distribution directory so subprocesses can find
         // libEGL.so, libGLESv2.so, .pak resources, etc. Without this, the
         // GPU process fails to initialize and crashes.
-        let cef_dir = cef::sys::get_cef_dir().expect("CEF distribution directory not found");
+        let cef_dir = match cef::sys::get_cef_dir() {
+            Some(dir) => dir,
+            None => {
+                log::error!(
+                    "iced_webview: CEF distribution directory not found. \
+                     Webview will be unavailable."
+                );
+                return Self {
+                    views: Vec::new(),
+                    parked_views: Vec::new(),
+                    scale_factor: 1.0,
+                    initialized: false,
+                    init_error: Some("CEF distribution directory not found".to_string()),
+                };
+            }
+        };
         let cef_dir_str = cef_dir.to_string_lossy();
 
         let locales_dir = cef_dir.join("locales");
