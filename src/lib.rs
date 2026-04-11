@@ -87,6 +87,7 @@ impl ImageInfo {
     const WIDTH: u32 = 800;
     const HEIGHT: u32 = 800;
 
+    #[allow(dead_code)]
     fn new(pixels: Vec<u8>, format: PixelFormat, width: u32, height: u32) -> Self {
         Self::from_arc(Arc::new(pixels), format, width, height)
     }

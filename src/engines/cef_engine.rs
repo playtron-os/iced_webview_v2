@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::os::raw::c_int;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use iced::keyboard;
@@ -279,21 +280,21 @@ struct ParkedView {
 ///     // ... iced application setup ...
 /// }
 /// ```
-pub struct Cef {
-    views: Vec<CefView>,
-    parked_views: Vec<ParkedView>,
-    scale_factor: f32,
-    initialized: bool,
-    init_error: Option<String>,
-}
+/// Global flag: CEF has been successfully initialized in this process.
+/// CEF does not support being initialized more than once per process,
+/// nor re-initialization after `shutdown()`. This flag ensures we call
+/// `initialize()` exactly once and never call `shutdown()`.
+static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-impl Default for Cef {
-    fn default() -> Self {
+/// Stores the initialization error from the first (and only) attempt.
+static CEF_INIT_ERROR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Run CEF global initialization exactly once. Returns `(success, error)`.
+fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
+    let error = CEF_INIT_ERROR.get_or_init(|| {
         let _ = api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
         let args = Args::new();
 
-        // Use XDG cache dir or /tmp as root_cache_path to avoid the
-        // "unintended process singleton behavior" warning.
         let cache_dir = std::env::var("XDG_CACHE_HOME").unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             format!("{home}/.cache")
@@ -302,16 +303,11 @@ impl Default for Cef {
         let _ = std::fs::create_dir_all(&cef_cache);
 
         // Remove stale singleton lock files from previous crashed runs.
-        // Without this, CEF detects an "existing browser session" and
-        // fails to initialize.
         for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
             let lock = std::path::Path::new(&cef_cache).join(name);
             let _ = std::fs::remove_file(&lock);
         }
 
-        // Point CEF to its distribution directory so subprocesses can find
-        // libEGL.so, libGLESv2.so, .pak resources, etc. Without this, the
-        // GPU process fails to initialize and crashes.
         let cef_dir = match cef::sys::get_cef_dir() {
             Some(dir) => dir,
             None => {
@@ -319,13 +315,7 @@ impl Default for Cef {
                     "iced_webview: CEF distribution directory not found. \
                      Webview will be unavailable."
                 );
-                return Self {
-                    views: Vec::new(),
-                    parked_views: Vec::new(),
-                    scale_factor: 1.0,
-                    initialized: false,
-                    init_error: Some("CEF distribution directory not found".to_string()),
-                };
+                return Some("CEF distribution directory not found".to_string());
             }
         };
         let cef_dir_str = cef_dir.to_string_lossy();
@@ -353,17 +343,14 @@ impl Default for Cef {
             std::ptr::null_mut(),
         );
 
-        let initialized = result == 1;
-        let init_error = if !initialized {
+        if result != 1 {
             let msg = format!(
                 "CEF initialize() returned {result} (expected 1). \
                  cef_dir={cef_dir_str}, cache={cef_cache}"
             );
             log::error!("iced_webview: {msg}");
-            Some(msg)
-        } else {
-            None
-        };
+            return Some(msg);
+        }
 
         // CEF's initialize() installs its own signal handlers that swallow
         // SIGINT — restore the default so a single Ctrl+C terminates the app.
@@ -372,12 +359,33 @@ impl Default for Cef {
             libc::signal(libc::SIGTERM, libc::SIG_DFL);
         }
 
+        CEF_INITIALIZED.store(true, Ordering::Release);
+        log::info!("iced_webview: CEF initialized successfully");
+        None // no error
+    });
+
+    let ok = CEF_INITIALIZED.load(Ordering::Acquire);
+    (ok, error.as_deref())
+}
+
+pub struct Cef {
+    views: Vec<CefView>,
+    parked_views: Vec<ParkedView>,
+    scale_factor: f32,
+    initialized: bool,
+    init_error: Option<String>,
+}
+
+impl Default for Cef {
+    fn default() -> Self {
+        let (initialized, init_error) = ensure_cef_initialized();
+
         Self {
             views: Vec::new(),
             parked_views: Vec::new(),
             scale_factor: 1.0,
             initialized,
-            init_error,
+            init_error: init_error.map(|s| s.to_string()),
         }
     }
 }
@@ -606,6 +614,11 @@ impl Engine for Cef {
                 host.close_browser(1);
             }
             self.views.remove(pos);
+            // Pump the message loop so CEF processes the close and
+            // renderer subprocesses can terminate.
+            for _ in 0..10 {
+                do_message_loop_work();
+            }
         }
     }
 
@@ -624,6 +637,11 @@ impl Engine for Cef {
                 host.close_browser(1);
             }
             self.parked_views.push(parked);
+            // Pump the message loop so CEF processes the close and
+            // renderer subprocesses can terminate.
+            for _ in 0..10 {
+                do_message_loop_work();
+            }
         }
     }
 
@@ -912,13 +930,15 @@ impl Drop for Cef {
         }
         self.views.clear();
 
+        // Pump the message loop to let close events propagate.
+        // We intentionally never call shutdown() — CEF does not support
+        // re-initialization after shutdown, and multiple Cef instances
+        // share the same global engine. The OS reclaims all resources
+        // when the process exits.
         if self.initialized {
-            // Pump the message loop a few times to let close events propagate
-            // to subprocesses before tearing down.
             for _ in 0..10 {
                 do_message_loop_work();
             }
-            shutdown();
         }
     }
 }
