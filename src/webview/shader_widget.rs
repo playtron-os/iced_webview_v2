@@ -380,6 +380,7 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                         state.dragging = true;
                     }
                 }
+                let was_dragging = state.dragging;
                 if matches!(event, mouse::Event::ButtonReleased(_)) {
                     state.dragging = false;
                 }
@@ -390,11 +391,20 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                         point,
                         state.modifiers,
                     )))
-                } else if state.dragging {
+                } else if was_dragging {
                     // Mouse captured: button was pressed inside and is still
-                    // held. Clamp coordinates to bounds so CEF continues
-                    // receiving drag events (scrollbar drag, text selection).
-                    if let Some(pos) = cursor.position() {
+                    // held (or just released). Forward events to CEF with
+                    // clamped coordinates so drag operations complete properly.
+                    if matches!(event, mouse::Event::CursorLeft) {
+                        // Cursor left the window while dragging. Send a
+                        // synthetic release so CEF cleans up its drag state.
+                        state.dragging = false;
+                        Some(shader::Action::publish(Action::SendMouseEvent(
+                            mouse::Event::ButtonReleased(mouse::Button::Left),
+                            Point::ORIGIN,
+                            state.modifiers,
+                        )))
+                    } else if let Some(pos) = cursor.position() {
                         let clamped = Point::new(
                             (pos.x - bounds.x).clamp(0.0, bounds.width),
                             (pos.y - bounds.y).clamp(0.0, bounds.height),
@@ -405,7 +415,19 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                             state.modifiers,
                         )))
                     } else {
-                        None
+                        // No cursor position available (e.g. pointer left the
+                        // window entirely on Wayland). Forward button releases
+                        // so CEF ends its drag state; swallow move events since
+                        // sending them at ORIGIN would jump the scroll position.
+                        if matches!(event, mouse::Event::ButtonReleased(_)) {
+                            Some(shader::Action::publish(Action::SendMouseEvent(
+                                *event,
+                                Point::ORIGIN,
+                                state.modifiers,
+                            )))
+                        } else {
+                            None
+                        }
                     }
                 } else if matches!(event, mouse::Event::CursorLeft) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
