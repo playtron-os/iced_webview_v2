@@ -196,6 +196,16 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// Take a pending popup URL from a view, if any.
+    ///
+    /// Called by the webview layer each update tick to detect popup requests.
+    /// Returns `Some(url)` when a popup was intercepted (e.g. by
+    /// `on_before_popup` in CEF/OSR mode which cannot display popups).
+    /// The consumer decides what to do: open in external browser, ignore, etc.
+    fn take_popup_url(&mut self, _id: ViewId) -> Option<String> {
+        None
+    }
+
     /// Return an initialization error message, if any.
     ///
     /// When the engine failed to initialize (missing runtime, bad config,

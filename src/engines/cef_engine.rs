@@ -30,6 +30,7 @@ struct SharedState {
     persistent_buffer: Arc<Vec<u8>>,
     persistent_size: (u32, u32),
     url: Option<String>,
+    popup_url: Option<String>,
     title: Option<String>,
     cursor_type: CursorType,
     size: Size<u32>,
@@ -198,6 +199,29 @@ wrap_life_span_handler! {
     impl LifeSpanHandler {
         fn on_after_created(&self, _browser: Option<&mut Browser>) {}
         fn on_before_close(&self, _browser: Option<&mut Browser>) {}
+        fn on_before_popup(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _popup_id: c_int,
+            target_url: Option<&CefString>,
+            _target_frame_name: Option<&CefString>,
+            _target_disposition: WindowOpenDisposition,
+            _user_gesture: c_int,
+            _popup_features: Option<&PopupFeatures>,
+            _window_info: Option<&mut WindowInfo>,
+            _client: Option<&mut Option<Client>>,
+            _settings: Option<&mut BrowserSettings>,
+            _extra_info: Option<&mut Option<DictionaryValue>>,
+            _no_javascript_access: Option<&mut c_int>,
+        ) -> c_int {
+            // Cancel the popup and route the URL through on_url_change instead
+            if let Some(url) = target_url {
+                let url_str = url.to_string();
+                self.shared.borrow_mut().popup_url = Some(url_str);
+            }
+            1 // non-zero cancels the popup
+        }
     }
 }
 
@@ -474,6 +498,7 @@ impl Cef {
             persistent_buffer: Arc::new(Vec::new()),
             persistent_size: (0, 0),
             url: None,
+            popup_url: None,
             title: None,
             cursor_type: CursorType::POINTER,
             size,
@@ -526,7 +551,7 @@ impl Cef {
 
 fn cursor_type_to_interaction(cursor: CursorType) -> Interaction {
     match cursor {
-        CursorType::POINTER => Interaction::Pointer,
+        CursorType::POINTER => Interaction::Idle,
         CursorType::IBEAM => Interaction::Text,
         CursorType::CROSS => Interaction::Crosshair,
         CursorType::HAND => Interaction::Pointer,
@@ -874,19 +899,18 @@ impl Engine for Cef {
         let Some(view) = self.find_view(id) else {
             return "about:blank".to_string();
         };
-        if let Some(frame) = view.browser.main_frame() {
-            let url_userfree = frame.url();
-            let url_cef: CefString = CefString::from(&url_userfree);
-            let s = url_cef.to_string();
-            if !s.is_empty() {
-                return s;
-            }
-        }
+        // Use view.url which is kept up-to-date by on_address_change callback.
+        // Avoids expensive frame.url() UTF-16→UTF-8 conversion every tick.
         if view.url.is_empty() {
             "about:blank".to_string()
         } else {
             view.url.clone()
         }
+    }
+
+    fn take_popup_url(&mut self, id: ViewId) -> Option<String> {
+        self.find_view(id)
+            .and_then(|view| view.shared.borrow_mut().popup_url.take())
     }
 
     fn get_title(&self, id: ViewId) -> String {

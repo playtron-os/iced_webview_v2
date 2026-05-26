@@ -74,6 +74,7 @@ where
     on_create_view: Option<Message>,
     on_url_change: Option<Box<dyn Fn(String) -> Message>>,
     url: String,
+    on_popup_request: Option<Box<dyn Fn(String) -> Message>>,
     on_title_change: Option<Box<dyn Fn(String) -> Message>>,
     title: String,
     on_copy: Option<Box<dyn Fn(String) -> Message>>,
@@ -124,6 +125,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             on_create_view: None,
             on_url_change: None,
             url: String::new(),
+            on_popup_request: None,
             on_title_change: None,
             title: String::new(),
             on_copy: None,
@@ -184,6 +186,22 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Subscribe to popup request events.
+    ///
+    /// Called when the web content attempts to open a popup (e.g. `target="_blank"` links,
+    /// `window.open()`). The callback receives the target URL and should return a Message.
+    /// In OSR mode, popups are always cancelled at the engine level — this callback lets
+    /// the client decide what to do with the URL (open in system browser, ignore, etc.).
+    ///
+    /// If not set, popup URLs are silently discarded.
+    pub fn on_popup_request(
+        mut self,
+        on_popup_request: impl Fn(String) -> Message + 'static,
+    ) -> Self {
+        self.on_popup_request = Some(Box::new(on_popup_request));
+        self
+    }
+
     /// subscribe to title change events
     pub fn on_title_change(
         mut self,
@@ -212,6 +230,13 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         let mut tasks = Vec::new();
 
         if self.current_view_index.is_some() {
+            // Check for intercepted popup URLs (separate from navigation)
+            if let Some(on_popup_request) = &self.on_popup_request {
+                let view_id = self.get_current_view_id();
+                if let Some(popup_url) = self.engine.take_popup_url(view_id) {
+                    tasks.push(Task::done(on_popup_request(popup_url)));
+                }
+            }
             if let Some(on_url_change) = &self.on_url_change {
                 let url = self.engine.get_url(self.get_current_view_id());
                 if self.url != url {
