@@ -474,6 +474,8 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(t_texture, t_sampler, in.uv);
+    var color = textureSample(t_texture, t_sampler, in.uv);
+    color.a = 1.0;
+    return color;
 }
 "#;
