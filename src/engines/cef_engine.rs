@@ -398,6 +398,10 @@ pub struct Cef {
     scale_factor: f32,
     initialized: bool,
     init_error: Option<String>,
+    /// Default background color for new browser views (ARGB u32, CEF format).
+    /// If `None`, CEF uses its default (opaque white with alpha=0 → black on
+    /// windowless). Set via `Engine::set_background_color`.
+    background_color: Option<u32>,
 }
 
 impl Default for Cef {
@@ -410,6 +414,7 @@ impl Default for Cef {
             scale_factor: 1.0,
             initialized,
             init_error: init_error.map(|s| s.to_string()),
+            background_color: None,
         }
     }
 }
@@ -519,6 +524,7 @@ impl Cef {
         let window_info = WindowInfo::default().set_as_windowless(0);
         let browser_settings = BrowserSettings {
             windowless_frame_rate: 60,
+            background_color: self.background_color.unwrap_or(0xFFFFFFFF),
             ..Default::default()
         };
 
@@ -732,6 +738,10 @@ impl Engine for Cef {
             }
             view.needs_render = true;
         }
+    }
+
+    fn set_background_color(&mut self, color: u32) {
+        self.background_color = Some(color);
     }
 
     fn handle_keyboard_event(&mut self, id: ViewId, event: keyboard::Event) {

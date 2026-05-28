@@ -91,6 +91,10 @@ pub trait Engine {
     /// Set the display scale factor for HiDPI rendering. Default is no-op.
     fn set_scale_factor(&mut self, _scale: f32) {}
 
+    /// Set the default background color for new views. The color is in ARGB
+    /// u32 format (e.g. 0xFF1A1A1A for opaque dark gray). Default is no-op.
+    fn set_background_color(&mut self, _color: u32) {}
+
     /// Whether this engine can fetch and render URLs natively.
     /// Engines that return `false` rely on the webview layer to fetch HTML.
     fn handles_urls(&self) -> bool {

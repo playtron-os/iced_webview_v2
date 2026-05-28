@@ -150,6 +150,13 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.set_scale_factor(scale);
     }
 
+    /// Set the default background color for new browser views.
+    /// Color is in ARGB u32 format (e.g. `0xFF1A1A1A` for opaque dark gray).
+    /// Call this before creating any views.
+    pub fn set_background_color(&mut self, color: u32) {
+        self.engine.set_background_color(color);
+    }
+
     /// Reads the scale factor detected by the shader viewport and applies it
     /// to the engine if it differs from the current value.
     fn apply_detected_scale(&mut self) {
