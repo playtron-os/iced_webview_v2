@@ -58,6 +58,8 @@ pub enum Action {
     /// layout so `doc.render()` can be skipped (redraw only).
     /// The u64 is the navigation epoch — stale results are discarded.
     ImageFetchComplete(ViewId, String, Result<Vec<u8>, String>, bool, u64),
+    /// Execute JavaScript code in the current view's main frame.
+    ExecuteJavaScript(String),
 }
 
 /// The Basic WebView widget that creates and shows webview(s)
@@ -535,6 +537,12 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 // Don't call request_render here — the periodic Update tick
                 // picks up staged images via request_render's staged check.
                 return Task::batch(tasks);
+            }
+            Action::ExecuteJavaScript(code) => {
+                if self.current_view_index.is_some() {
+                    let id = self.get_current_view_id();
+                    self.engine.execute_javascript(id, &code);
+                }
             }
         };
 

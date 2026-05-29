@@ -200,6 +200,10 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// Execute JavaScript code in a view's main frame.
+    /// No-op on engines that do not support script execution.
+    fn execute_javascript(&mut self, _id: ViewId, _code: &str) {}
+
     /// Take a pending popup URL from a view, if any.
     ///
     /// Called by the webview layer each update tick to detect popup requests.

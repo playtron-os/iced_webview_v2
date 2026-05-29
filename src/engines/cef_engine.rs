@@ -887,6 +887,17 @@ impl Engine for Cef {
         }
     }
 
+    fn execute_javascript(&mut self, id: ViewId, code: &str) {
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
+        let Some(frame) = view.browser.main_frame() else {
+            return;
+        };
+        let cef_code = CefString::from(code);
+        frame.execute_java_script(Some(&cef_code), None, 0);
+    }
+
     fn refresh(&mut self, id: ViewId) {
         if let Some(view) = self.find_view(id) {
             view.browser.reload();
