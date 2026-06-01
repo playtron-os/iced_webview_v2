@@ -35,6 +35,8 @@ struct SharedState {
     cursor_type: CursorType,
     size: Size<u32>,
     scale_factor: f32,
+    /// Set to `true` by the load handler when a page finishes loading.
+    page_loaded: bool,
 }
 
 // -- CEF App handler --
@@ -225,6 +227,26 @@ wrap_life_span_handler! {
     }
 }
 
+wrap_load_handler! {
+    struct OsrLoadHandler {
+        shared: Rc<RefCell<SharedState>>,
+    }
+
+    impl LoadHandler {
+        fn on_loading_state_change(
+            &self,
+            _browser: Option<&mut Browser>,
+            is_loading: c_int,
+            _can_go_back: c_int,
+            _can_go_forward: c_int,
+        ) {
+            if is_loading == 0 {
+                self.shared.borrow_mut().page_loaded = true;
+            }
+        }
+    }
+}
+
 use super::cef_dialog::OsrDialogHandler;
 
 wrap_client! {
@@ -232,6 +254,7 @@ wrap_client! {
         render_handler: RenderHandler,
         display_handler: DisplayHandler,
         life_span_handler: LifeSpanHandler,
+        load_handler: LoadHandler,
         dialog_handler: DialogHandler,
     }
 
@@ -246,6 +269,10 @@ wrap_client! {
 
         fn life_span_handler(&self) -> Option<LifeSpanHandler> {
             Some(self.life_span_handler.clone())
+        }
+
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(self.load_handler.clone())
         }
 
         fn dialog_handler(&self) -> Option<DialogHandler> {
@@ -508,16 +535,19 @@ impl Cef {
             cursor_type: CursorType::POINTER,
             size,
             scale_factor: self.scale_factor,
+            page_loaded: false,
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
         let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
         let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
+        let load_handler = OsrLoadHandler::new(Rc::clone(&shared));
         let dialog_handler = OsrDialogHandler::new();
         let mut client = OsrClient::new(
             render_handler,
             display_handler,
             life_span_handler,
+            load_handler,
             dialog_handler,
         );
 
@@ -748,10 +778,71 @@ impl Engine for Cef {
         let Some(view) = self.find_view_mut(id) else {
             return;
         };
-        if let Some(host) = view.browser.host() {
-            if let Some(ke) = iced_keyboard_to_cef(event) {
-                host.send_key_event(Some(&ke));
+        let Some(host) = view.browser.host() else {
+            return;
+        };
+
+        match &event {
+            keyboard::Event::KeyPressed {
+                key,
+                text,
+                modifiers,
+                ..
+            } => {
+                let cef_modifiers = iced_modifiers_to_cef_key(*modifiers);
+                // Send RAWKEYDOWN with the unmodified key's virtual key code
+                if let Some((vk, unmod_char)) = iced_key_to_cef(key) {
+                    let ke = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: KeyEventType::RAWKEYDOWN,
+                        modifiers: cef_modifiers,
+                        windows_key_code: vk as c_int,
+                        native_key_code: 0,
+                        is_system_key: 0,
+                        character: unmod_char,
+                        unmodified_character: unmod_char,
+                        focus_on_editable_field: 0,
+                    };
+                    host.send_key_event(Some(&ke));
+                }
+                // Send CHAR event with the actual text character produced
+                let char_code = text
+                    .as_ref()
+                    .and_then(|t| t.chars().next())
+                    .map(|c| c as u16);
+                if let Some(ch) = char_code {
+                    let char_event = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: KeyEventType::CHAR,
+                        modifiers: cef_modifiers,
+                        windows_key_code: ch as c_int,
+                        native_key_code: 0,
+                        is_system_key: 0,
+                        character: ch,
+                        unmodified_character: ch,
+                        focus_on_editable_field: 0,
+                    };
+                    host.send_key_event(Some(&char_event));
+                }
             }
+            keyboard::Event::KeyReleased { key, modifiers, .. } => {
+                let cef_modifiers = iced_modifiers_to_cef_key(*modifiers);
+                if let Some((vk, character)) = iced_key_to_cef(key) {
+                    let ke = KeyEvent {
+                        size: std::mem::size_of::<KeyEvent>(),
+                        type_: KeyEventType::KEYUP,
+                        modifiers: cef_modifiers,
+                        windows_key_code: vk as c_int,
+                        native_key_code: 0,
+                        is_system_key: 0,
+                        character,
+                        unmodified_character: character,
+                        focus_on_editable_field: 0,
+                    };
+                    host.send_key_event(Some(&ke));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -773,6 +864,10 @@ impl Engine for Cef {
 
         match event {
             mouse::Event::ButtonPressed(button) => {
+                // Notify CEF that the browser has host-level focus (required
+                // for input fields to activate in OSR mode).
+                host.set_focus(1);
+
                 // Set the button flag *before* building MouseEvent so the
                 // press itself already carries the held-button flag.
                 view.pressed_buttons |= mouse_button_event_flag(button);
@@ -934,6 +1029,17 @@ impl Engine for Cef {
             .and_then(|view| view.shared.borrow_mut().popup_url.take())
     }
 
+    fn take_page_loaded(&mut self, id: ViewId) -> bool {
+        self.find_view(id)
+            .map(|view| {
+                let mut shared = view.shared.borrow_mut();
+                let loaded = shared.page_loaded;
+                shared.page_loaded = false;
+                loaded
+            })
+            .unwrap_or(false)
+    }
+
     fn get_title(&self, id: ViewId) -> String {
         self.find_view(id)
             .map(|v| v.title.clone())
@@ -1022,46 +1128,18 @@ fn iced_modifiers_to_cef(modifiers: keyboard::Modifiers) -> u32 {
     flags
 }
 
-fn iced_keyboard_to_cef(event: keyboard::Event) -> Option<KeyEvent> {
-    let (key_type, key, modifiers) = match event {
-        keyboard::Event::KeyPressed {
-            key: iced_key,
-            modifiers: mods,
-            ..
-        } => (KeyEventType::RAWKEYDOWN, iced_key, mods),
-        keyboard::Event::KeyReleased {
-            key: iced_key,
-            modifiers: mods,
-            ..
-        } => (KeyEventType::KEYUP, iced_key, mods),
-        _ => return None,
-    };
-
-    let (windows_key_code, character) = iced_key_to_cef(&key)?;
-
-    // Event flag constants: SHIFT=2, CONTROL=4, ALT=8
-    let mut cef_modifiers: u32 = 0;
+fn iced_modifiers_to_cef_key(modifiers: keyboard::Modifiers) -> u32 {
+    let mut flags: u32 = 0;
     if modifiers.shift() {
-        cef_modifiers |= 2;
+        flags |= 2; // EVENTFLAG_SHIFT_DOWN
     }
     if modifiers.control() {
-        cef_modifiers |= 4;
+        flags |= 4; // EVENTFLAG_CONTROL_DOWN
     }
     if modifiers.alt() {
-        cef_modifiers |= 8;
+        flags |= 8; // EVENTFLAG_ALT_DOWN
     }
-
-    Some(KeyEvent {
-        size: std::mem::size_of::<KeyEvent>(),
-        type_: key_type,
-        modifiers: cef_modifiers,
-        windows_key_code: windows_key_code as c_int,
-        native_key_code: 0,
-        is_system_key: 0,
-        character,
-        unmodified_character: character,
-        focus_on_editable_field: 0,
-    })
+    flags
 }
 
 fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
@@ -1072,8 +1150,26 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
             let ch = s.chars().next()?;
             let vk = if ch.is_ascii_alphabetic() {
                 ch.to_ascii_uppercase() as i32
+            } else if ch.is_ascii_digit() {
+                ch as i32 // 0x30..=0x39 — same as VK_0..VK_9
             } else {
-                ch as i32
+                // Map punctuation to Windows OEM VK codes to avoid
+                // collisions with control keys (e.g. '.'=46=VK_DELETE).
+                match ch {
+                    '.' | '>' => 0xBE,  // VK_OEM_PERIOD
+                    ',' | '<' => 0xBC,  // VK_OEM_COMMA
+                    ';' | ':' => 0xBA,  // VK_OEM_1
+                    '/' | '?' => 0xBF,  // VK_OEM_2
+                    '`' | '~' => 0xC0,  // VK_OEM_3
+                    '[' | '{' => 0xDB,  // VK_OEM_4
+                    '\\' | '|' => 0xDC, // VK_OEM_5
+                    ']' | '}' => 0xDD,  // VK_OEM_6
+                    '\'' | '"' => 0xDE, // VK_OEM_7
+                    '-' | '_' => 0xBD,  // VK_OEM_MINUS
+                    '=' | '+' => 0xBB,  // VK_OEM_PLUS
+                    ' ' => 0x20,        // VK_SPACE
+                    _ => ch as i32,     // fallback for other chars
+                }
             };
             Some((vk, ch as u16))
         }
@@ -1106,6 +1202,11 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
                 Named::F10 => (0x79, 0),
                 Named::F11 => (0x7A, 0),
                 Named::F12 => (0x7B, 0),
+                Named::Shift => (0x10, 0),
+                Named::Control => (0x11, 0),
+                Named::Alt => (0x12, 0),
+                Named::Super => (0x5B, 0),
+                Named::CapsLock => (0x14, 0),
                 _ => return None,
             };
             Some((vk, ch))

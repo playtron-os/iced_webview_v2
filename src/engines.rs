@@ -204,6 +204,12 @@ pub trait Engine {
     /// No-op on engines that do not support script execution.
     fn execute_javascript(&mut self, _id: ViewId, _code: &str) {}
 
+    /// Returns `true` (once) when a page finishes loading in the given view.
+    /// Resets the flag so subsequent calls return `false` until the next load.
+    fn take_page_loaded(&mut self, _id: ViewId) -> bool {
+        false
+    }
+
     /// Take a pending popup URL from a view, if any.
     ///
     /// Called by the webview layer each update tick to detect popup requests.

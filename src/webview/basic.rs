@@ -79,6 +79,7 @@ where
     on_popup_request: Option<Box<dyn Fn(String) -> Message>>,
     on_title_change: Option<Box<dyn Fn(String) -> Message>>,
     title: String,
+    on_page_loaded: Option<Box<dyn Fn() -> Message>>,
     on_copy: Option<Box<dyn Fn(String) -> Message>>,
     action_mapper: Option<Arc<dyn Fn(Action) -> Message + Send + Sync>>,
     /// Number of image fetches currently in flight. Staged images are only
@@ -130,6 +131,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             on_popup_request: None,
             on_title_change: None,
             title: String::new(),
+            on_page_loaded: None,
             on_copy: None,
             action_mapper: None,
             inflight_images: 0,
@@ -220,6 +222,13 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Subscribe to page load completion events.
+    /// Fires each time a page finishes loading in the current view.
+    pub fn on_page_loaded(mut self, on_page_loaded: impl Fn() -> Message + 'static) -> Self {
+        self.on_page_loaded = Some(Box::new(on_page_loaded));
+        self
+    }
+
     /// Subscribe to copy events (text selection copied via Ctrl+C / Cmd+C)
     pub fn on_copy(mut self, on_copy: impl Fn(String) -> Message + 'static) -> Self {
         self.on_copy = Some(Box::new(on_copy));
@@ -258,6 +267,11 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 if self.title != title {
                     self.title = title.clone();
                     tasks.push(Task::done(on_title_change(title)))
+                }
+            }
+            if let Some(on_page_loaded) = &self.on_page_loaded {
+                if self.engine.take_page_loaded(self.get_current_view_id()) {
+                    tasks.push(Task::done(on_page_loaded()));
                 }
             }
         }
