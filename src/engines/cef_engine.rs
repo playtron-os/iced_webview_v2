@@ -455,14 +455,17 @@ pub struct Cef {
 
 impl Default for Cef {
     fn default() -> Self {
-        let (initialized, init_error) = ensure_cef_initialized();
-
+        // NB: do NOT initialize CEF here. The engine struct may be constructed on
+        // a different thread (iced's `boot()` on the main thread) than the one
+        // that pumps CEF (`update()` on the render worker thread under
+        // `off-thread-render`). Init is deferred to first use via
+        // `ensure_initialized()` so it lands on the pump thread.
         Self {
             views: Vec::new(),
             parked_views: Vec::new(),
             scale_factor: 1.0,
-            initialized,
-            init_error: init_error.map(|s| s.to_string()),
+            initialized: false,
+            init_error: None,
             background_color: None,
         }
     }
@@ -522,6 +525,25 @@ pub fn cef_subprocess_check() -> bool {
 }
 
 impl Cef {
+    /// Lazily run CEF global initialization on the *current* thread — the one
+    /// that pumps the message loop (`update`) and makes all browser calls.
+    ///
+    /// CEF requires `CefInitialize`, `CefDoMessageLoopWork` and every browser API
+    /// call to happen on a single, consistent thread. With iced's
+    /// `off-thread-render`, the engine struct is constructed during `boot()` on
+    /// the main thread but `update()`/`new_view()` run on the render worker
+    /// thread — so initializing in `Default` would bind CEF to the wrong thread.
+    /// Deferring init to first use keeps it on the pump thread. Idempotent and
+    /// cheap after the first call (the global init is `OnceLock`-guarded).
+    fn ensure_initialized(&mut self) {
+        if self.initialized || self.init_error.is_some() {
+            return;
+        }
+        let (initialized, init_error) = ensure_cef_initialized();
+        self.initialized = initialized;
+        self.init_error = init_error.map(|s| s.to_string());
+    }
+
     fn find_view(&self, id: ViewId) -> Option<&CefView> {
         self.views.iter().find(|v| v.id == id)
     }
@@ -637,6 +659,8 @@ impl Engine for Cef {
     }
 
     fn update(&mut self) {
+        // First use pumps init onto the pump thread (see `ensure_initialized`).
+        self.ensure_initialized();
         if !self.initialized {
             return;
         }
@@ -679,6 +703,9 @@ impl Engine for Cef {
     }
 
     fn new_view(&mut self, size: Size<u32>, content: Option<PageType>) -> ViewId {
+        // A browser may be created before the first `update()`; make sure CEF is
+        // initialized on this (the pump) thread first.
+        self.ensure_initialized();
         let id = rand::thread_rng().gen();
 
         if let Some(view) = self.create_browser_view(id, size, None) {
