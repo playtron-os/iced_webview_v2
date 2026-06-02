@@ -30,7 +30,7 @@ use iced::widget::image;
 
 /// Engine Trait and Engine implementations
 pub mod engines;
-pub use engines::{Engine, PageType, PixelFormat, ViewId};
+pub use engines::{ConsoleMessage, Engine, PageType, PixelFormat, ViewId};
 
 mod webview;
 pub use basic::{Action, WebView};

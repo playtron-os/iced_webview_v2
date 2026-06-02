@@ -79,6 +79,7 @@ where
     on_popup_request: Option<Box<dyn Fn(String) -> Message>>,
     on_title_change: Option<Box<dyn Fn(String) -> Message>>,
     title: String,
+    on_console_message: Option<Box<dyn Fn(engines::ConsoleMessage) -> Message>>,
     on_page_loaded: Option<Box<dyn Fn() -> Message>>,
     on_copy: Option<Box<dyn Fn(String) -> Message>>,
     action_mapper: Option<Arc<dyn Fn(Action) -> Message + Send + Sync>>,
@@ -131,6 +132,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             on_popup_request: None,
             on_title_change: None,
             title: String::new(),
+            on_console_message: None,
             on_page_loaded: None,
             on_copy: None,
             action_mapper: None,
@@ -222,6 +224,17 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Subscribe to console messages (`console.log`/`warn`/`error`/…) emitted
+    /// by pages in the current view. The consumer decides how to handle them
+    /// (log, forward to a tracing span, ignore, etc.).
+    pub fn on_console_message(
+        mut self,
+        on_console_message: impl Fn(engines::ConsoleMessage) -> Message + 'static,
+    ) -> Self {
+        self.on_console_message = Some(Box::new(on_console_message));
+        self
+    }
+
     /// Subscribe to page load completion events.
     /// Fires each time a page finishes loading in the current view.
     pub fn on_page_loaded(mut self, on_page_loaded: impl Fn() -> Message + 'static) -> Self {
@@ -267,6 +280,12 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 if self.title != title {
                     self.title = title.clone();
                     tasks.push(Task::done(on_title_change(title)))
+                }
+            }
+            if let Some(on_console_message) = &self.on_console_message {
+                let view_id = self.get_current_view_id();
+                for msg in self.engine.take_console_messages(view_id) {
+                    tasks.push(Task::done(on_console_message(msg)));
                 }
             }
             if let Some(on_page_loaded) = &self.on_page_loaded {

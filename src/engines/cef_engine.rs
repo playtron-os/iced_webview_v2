@@ -9,7 +9,7 @@ use iced::mouse::{self, Interaction};
 use iced::{Point, Size};
 use rand::Rng;
 
-use super::{Engine, PageType, PixelFormat, ViewId};
+use super::{ConsoleMessage, Engine, PageType, PixelFormat, ViewId};
 use crate::ImageInfo;
 
 // Pull in all CEF types, traits, and macros. The wrap_*! macros reference
@@ -37,6 +37,8 @@ struct SharedState {
     scale_factor: f32,
     /// Set to `true` by the load handler when a page finishes loading.
     page_loaded: bool,
+    /// Console messages emitted by the page, drained by the webview layer.
+    console_messages: Vec<ConsoleMessage>,
 }
 
 // -- CEF App handler --
@@ -178,6 +180,26 @@ wrap_display_handler! {
             if let Some(title) = title {
                 self.shared.borrow_mut().title = Some(title.to_string());
             }
+        }
+
+        // Capture page `console.log`/`warn`/`error` output into the shared
+        // queue. The webview layer drains it each tick and hands each message
+        // to the consumer's `on_console_message` callback.
+        fn on_console_message(
+            &self,
+            _browser: Option<&mut Browser>,
+            level: LogSeverity,
+            message: Option<&CefString>,
+            source: Option<&CefString>,
+            line: c_int,
+        ) -> c_int {
+            self.shared.borrow_mut().console_messages.push(ConsoleMessage {
+                level: level.get_raw() as i32,
+                message: message.map(|m| m.to_string()).unwrap_or_default(),
+                source: source.map(|s| s.to_string()).unwrap_or_default(),
+                line: line as i32,
+            });
+            0 // allow default handling
         }
 
         fn on_cursor_change(
@@ -536,6 +558,7 @@ impl Cef {
             size,
             scale_factor: self.scale_factor,
             page_loaded: false,
+            console_messages: Vec::new(),
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
@@ -1038,6 +1061,12 @@ impl Engine for Cef {
                 loaded
             })
             .unwrap_or(false)
+    }
+
+    fn take_console_messages(&mut self, id: ViewId) -> Vec<ConsoleMessage> {
+        self.find_view(id)
+            .map(|view| std::mem::take(&mut view.shared.borrow_mut().console_messages))
+            .unwrap_or_default()
     }
 
     fn get_title(&self, id: ViewId) -> String {

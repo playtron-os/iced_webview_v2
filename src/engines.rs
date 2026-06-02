@@ -35,6 +35,20 @@ pub enum PageType {
     Html(String),
 }
 
+/// A console message (`console.log`/`warn`/`error`/…) emitted by a page,
+/// surfaced to the consumer via `WebView::on_console_message`.
+#[derive(Clone, Debug)]
+pub struct ConsoleMessage {
+    /// Raw CEF log severity level (higher is more severe).
+    pub level: i32,
+    /// The logged message text.
+    pub message: String,
+    /// Source location (script URL) the message originated from.
+    pub source: String,
+    /// Line number within the source.
+    pub line: i32,
+}
+
 /// Enables browser engines to display their images in different formats
 #[derive(Clone, Debug)]
 pub enum PixelFormat {
@@ -208,6 +222,12 @@ pub trait Engine {
     /// Resets the flag so subsequent calls return `false` until the next load.
     fn take_page_loaded(&mut self, _id: ViewId) -> bool {
         false
+    }
+
+    /// Drain console messages emitted by a view since the last call.
+    /// No-op on engines that do not capture console output.
+    fn take_console_messages(&mut self, _id: ViewId) -> Vec<ConsoleMessage> {
+        Vec::new()
     }
 
     /// Take a pending popup URL from a view, if any.
