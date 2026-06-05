@@ -163,6 +163,16 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.set_background_color(color);
     }
 
+    /// Block top-level navigation away from the loaded document. Intended for
+    /// single-document viewers (e.g. an email renderer) that must never follow
+    /// links in place: a clicked link is cancelled and surfaced through
+    /// `on_popup_request` instead, so the host can open it externally.
+    /// Navigation is allowed by default. Call this before creating any views.
+    pub fn block_navigation(mut self) -> Self {
+        self.engine.set_block_navigation(true);
+        self
+    }
+
     /// Reads the scale factor detected by the shader viewport and applies it
     /// to the engine if it differs from the current value.
     fn apply_detected_scale(&mut self) {

@@ -109,6 +109,14 @@ pub trait Engine {
     /// u32 format (e.g. 0xFF1A1A1A for opaque dark gray). Default is no-op.
     fn set_background_color(&mut self, _color: u32) {}
 
+    /// Block top-level navigations away from the loaded document. When enabled,
+    /// link clicks are cancelled and surfaced through the popup-url channel
+    /// (`on_popup_request`) instead of navigating the view in place — intended
+    /// for single-document viewers such as an email renderer. Disabled by
+    /// default so views navigate like a normal browser. Default is no-op for
+    /// engines that don't support it.
+    fn set_block_navigation(&mut self, _block: bool) {}
+
     /// Whether this engine can fetch and render URLs natively.
     /// Engines that return `false` rely on the webview layer to fetch HTML.
     fn handles_urls(&self) -> bool {

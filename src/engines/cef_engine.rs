@@ -39,6 +39,10 @@ struct SharedState {
     page_loaded: bool,
     /// Console messages emitted by the page, drained by the webview layer.
     console_messages: Vec<ConsoleMessage>,
+    /// When `true`, the request handler cancels top-level navigations away
+    /// from the loaded document and surfaces them via `popup_url` instead.
+    /// Opt-in; off by default so the view behaves like a normal browser.
+    block_navigation: bool,
 }
 
 // -- CEF App handler --
@@ -269,6 +273,61 @@ wrap_load_handler! {
     }
 }
 
+wrap_request_handler! {
+    struct OsrRequestHandler {
+        shared: Rc<RefCell<SharedState>>,
+    }
+
+    impl RequestHandler {
+        // Optionally prevent the view from navigating away from its loaded
+        // document. This is opt-in per view (see `Engine::set_block_navigation`)
+        // and is meant for single-document viewers such as an email renderer:
+        // the page is loaded as a `data:` URL, and any other top-level
+        // navigation (a clicked link) is cancelled here and routed to the host
+        // via `popup_url`, which the consumer typically opens in the external
+        // browser — matching how `on_before_popup` handles `target="_blank"`.
+        //
+        // When the flag is unset (the default) this is a no-op and the view
+        // navigates like a normal browser, so other consumers are unaffected.
+        fn on_before_browse(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _user_gesture: c_int,
+            _is_redirect: c_int,
+        ) -> c_int {
+            if !self.shared.borrow().block_navigation {
+                return 0; // navigation allowed (default browser behavior)
+            }
+
+            // Only constrain the main frame. Sub-frames (e.g. an iframe
+            // embedded in the document) are allowed to load their own content.
+            let is_main = frame.map(|f| f.is_main() != 0).unwrap_or(true);
+            if !is_main {
+                return 0; // allow sub-frame navigation
+            }
+
+            let Some(request) = request else {
+                return 0;
+            };
+            let url = CefString::from(&request.url()).to_string();
+
+            // The document itself is a `data:` URL — allow it (and in-page
+            // anchor jumps, which keep the same `data:` prefix). `about:blank`
+            // is the browser's initial placeholder document.
+            if url.is_empty() || url.starts_with("data:") || url == "about:blank" {
+                return 0; // allow
+            }
+
+            // A real navigation (link click). Cancel it and hand the URL to
+            // the host to open externally.
+            self.shared.borrow_mut().popup_url = Some(url);
+            1 // non-zero cancels the navigation
+        }
+    }
+}
+
 use super::cef_dialog::OsrDialogHandler;
 
 wrap_client! {
@@ -277,6 +336,7 @@ wrap_client! {
         display_handler: DisplayHandler,
         life_span_handler: LifeSpanHandler,
         load_handler: LoadHandler,
+        request_handler: RequestHandler,
         dialog_handler: DialogHandler,
     }
 
@@ -295,6 +355,10 @@ wrap_client! {
 
         fn load_handler(&self) -> Option<LoadHandler> {
             Some(self.load_handler.clone())
+        }
+
+        fn request_handler(&self) -> Option<RequestHandler> {
+            Some(self.request_handler.clone())
         }
 
         fn dialog_handler(&self) -> Option<DialogHandler> {
@@ -451,6 +515,9 @@ pub struct Cef {
     /// If `None`, CEF uses its default (opaque white with alpha=0 → black on
     /// windowless). Set via `Engine::set_background_color`.
     background_color: Option<u32>,
+    /// When `true`, new views block top-level navigation away from their
+    /// loaded document (see `set_block_navigation`). Off by default.
+    block_navigation: bool,
 }
 
 impl Default for Cef {
@@ -467,6 +534,7 @@ impl Default for Cef {
             initialized: false,
             init_error: None,
             background_color: None,
+            block_navigation: false,
         }
     }
 }
@@ -581,18 +649,21 @@ impl Cef {
             scale_factor: self.scale_factor,
             page_loaded: false,
             console_messages: Vec::new(),
+            block_navigation: self.block_navigation,
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
         let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
         let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
         let load_handler = OsrLoadHandler::new(Rc::clone(&shared));
+        let request_handler = OsrRequestHandler::new(Rc::clone(&shared));
         let dialog_handler = OsrDialogHandler::new();
         let mut client = OsrClient::new(
             render_handler,
             display_handler,
             life_span_handler,
             load_handler,
+            request_handler,
             dialog_handler,
         );
 
@@ -822,6 +893,15 @@ impl Engine for Cef {
 
     fn set_background_color(&mut self, color: u32) {
         self.background_color = Some(color);
+    }
+
+    fn set_block_navigation(&mut self, block: bool) {
+        self.block_navigation = block;
+        // Propagate to any already-created views so the flag can be toggled
+        // after construction, not just at view-creation time.
+        for view in &mut self.views {
+            view.shared.borrow_mut().block_navigation = block;
+        }
     }
 
     fn handle_keyboard_event(&mut self, id: ViewId, event: keyboard::Event) {
