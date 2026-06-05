@@ -76,6 +76,10 @@ pub struct WebViewPipeline {
     texture_size: (u32, u32),
     /// Current texture pixel format so we can recreate with the right format.
     texture_format: wgpu::TextureFormat,
+    /// Whether the render target is an sRGB format. CEF delivers sRGB display
+    /// bytes; the uploaded texture's sRGB-ness MUST match the target's so the
+    /// bytes reach the screen unchanged (see `to_wgpu_format`).
+    target_is_srgb: bool,
     /// Tracks the data pointer of the last uploaded pixel buffer.
     /// When the Arc points to the same allocation, the frame is unchanged
     /// and `write_texture()` can be skipped entirely.
@@ -115,10 +119,24 @@ impl WebViewPipeline {
 }
 
 /// Maps our `PixelFormat` to the matching wgpu texture format.
-fn to_wgpu_format(pf: &PixelFormat) -> wgpu::TextureFormat {
-    match pf {
-        PixelFormat::Bgra => wgpu::TextureFormat::Bgra8UnormSrgb,
-        PixelFormat::Rgba => wgpu::TextureFormat::Rgba8UnormSrgb,
+///
+/// The texture's sRGB-ness MUST match the render target's. CEF delivers sRGB
+/// display bytes (what a screenshot contains). When the iced surface is an _Srgb
+/// format the sampler decodes sRGB→linear and the target re-encodes linear→sRGB,
+/// so the bytes round-trip. But iced's `web-colors` mode (which this app enables
+/// via icetron) sets `GAMMA_CORRECTION=false`, making iced pick a LINEAR (_Unorm)
+/// surface and upload its OWN image atlas as `Rgba8Unorm` — i.e. it passes sRGB
+/// bytes straight through with no decode. If we used an _Srgb texture against
+/// that linear target, the sampler's sRGB→linear decode is never re-encoded, so
+/// midtones crush toward black (a `#212429` page renders ~`#040506` — the "way
+/// too dark" webview bug). So we mirror the target: _Srgb texture for an _Srgb
+/// surface, plain _Unorm texture for a linear surface — exactly like the atlas.
+fn to_wgpu_format(pf: &PixelFormat, target_is_srgb: bool) -> wgpu::TextureFormat {
+    match (pf, target_is_srgb) {
+        (PixelFormat::Bgra, true) => wgpu::TextureFormat::Bgra8UnormSrgb,
+        (PixelFormat::Bgra, false) => wgpu::TextureFormat::Bgra8Unorm,
+        (PixelFormat::Rgba, true) => wgpu::TextureFormat::Rgba8UnormSrgb,
+        (PixelFormat::Rgba, false) => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
 
@@ -164,7 +182,7 @@ impl shader::Primitive for WebViewPrimitive {
         self.detected_scale
             .store(viewport.scale_factor().to_bits(), Ordering::Relaxed);
 
-        let needed_format = to_wgpu_format(&self.pixel_format);
+        let needed_format = to_wgpu_format(&self.pixel_format, pipeline.target_is_srgb);
         if (self.width, self.height) != pipeline.texture_size
             || needed_format != pipeline.texture_format
         {
@@ -219,7 +237,14 @@ impl shader::Primitive for WebViewPrimitive {
 
 impl shader::Pipeline for WebViewPipeline {
     fn new(device: &wgpu::Device, _queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
-        let initial_tex_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        // Match the texture's sRGB-ness to the iced render target so CEF's sRGB
+        // bytes reach the screen unchanged (see `to_wgpu_format`).
+        let target_is_srgb = format.is_srgb();
+        let initial_tex_format = if target_is_srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        };
         let (texture, texture_view) = create_texture(device, 1, 1, initial_tex_format);
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -315,6 +340,7 @@ impl shader::Pipeline for WebViewPipeline {
             render_pipeline,
             texture_size: (1, 1),
             texture_format: initial_tex_format,
+            target_is_srgb,
             last_pixels_ptr: 0,
         }
     }
