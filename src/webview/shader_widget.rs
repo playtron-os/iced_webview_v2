@@ -4,10 +4,11 @@ use std::sync::Arc;
 use iced::mouse::{self, Interaction};
 use iced::wgpu;
 use iced::widget::shader;
-use iced::{keyboard, Event, Point, Rectangle, Size};
+use iced::{keyboard, touch, Event, Point, Rectangle, Size};
 
 use crate::engines::PixelFormat;
 use crate::webview::basic::Action;
+use crate::webview::{is_touch_release, touch_to_mouse};
 use crate::ImageInfo;
 
 /// Shader-based rendering for servo webview content.
@@ -458,6 +459,41 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                 } else if matches!(event, mouse::Event::CursorLeft) {
                     Some(shader::Action::publish(Action::SendMouseEvent(
                         *event,
+                        Point::ORIGIN,
+                        state.modifiers,
+                    )))
+                } else {
+                    None
+                }
+            }
+            Event::Touch(touch_event) => {
+                // Emulate mouse input for the engine (tap = click, drag = move).
+                let synthetic = touch_to_mouse(touch_event);
+                let released = is_touch_release(touch_event);
+
+                if matches!(touch_event, touch::Event::FingerPressed { .. }) {
+                    let inside = cursor.position_in(bounds).is_some();
+                    state.focused = inside;
+                    if inside {
+                        state.dragging = true;
+                    }
+                }
+                let was_dragging = state.dragging;
+                if released {
+                    state.dragging = false;
+                }
+
+                if let Some(point) = cursor.position_in(bounds) {
+                    Some(shader::Action::publish(Action::SendMouseEvent(
+                        synthetic,
+                        point,
+                        state.modifiers,
+                    )))
+                } else if was_dragging && released {
+                    // Finger lifted/cancelled outside the view while dragging —
+                    // send a release so the engine ends its drag state.
+                    Some(shader::Action::publish(Action::SendMouseEvent(
+                        mouse::Event::ButtonReleased(mouse::Button::Left),
                         Point::ORIGIN,
                         state.modifiers,
                     )))

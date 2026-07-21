@@ -13,6 +13,8 @@ use iced::keyboard;
 use iced::mouse::{self, Interaction};
 use iced::{Element, Point, Size, Task};
 use iced::{Event, Length, Rectangle};
+
+use crate::webview::{is_touch_release, touch_to_mouse};
 use url::Url;
 
 use crate::{engines, ImageInfo, PageType, ViewId};
@@ -800,6 +802,23 @@ where
                 } else if matches!(event, mouse::Event::CursorLeft) {
                     shell.publish(Action::SendMouseEvent(
                         *event,
+                        Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
+                    ));
+                }
+            }
+            Event::Touch(touch_event) => {
+                // Emulate mouse input for the engine (tap = click, drag = move).
+                let synthetic = touch_to_mouse(touch_event);
+                if let Some(point) = cursor.position_in(layout.bounds()) {
+                    shell.publish(Action::SendMouseEvent(
+                        synthetic,
+                        point,
+                        keyboard::Modifiers::empty(),
+                    ));
+                } else if is_touch_release(touch_event) {
+                    shell.publish(Action::SendMouseEvent(
+                        synthetic,
                         Point::ORIGIN,
                         keyboard::Modifiers::empty(),
                     ));

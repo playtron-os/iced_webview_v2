@@ -19,6 +19,7 @@ use crate::{engines, ImageInfo, PageType, ViewId};
 
 #[cfg(any(feature = "servo", feature = "cef"))]
 use crate::webview::shader_widget::WebViewPrimitive;
+use crate::webview::{is_touch_release, touch_to_mouse};
 #[cfg(any(feature = "servo", feature = "cef"))]
 use iced::widget::shader;
 
@@ -617,6 +618,29 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
                     None
                 }
             }
+            Event::Touch(touch_event) => {
+                // Emulate mouse input for the engine (tap = click, drag = move).
+                let synthetic = touch_to_mouse(touch_event);
+                if let Some(point) = cursor.position_in(bounds) {
+                    Some(shader::Action::publish(Action::SendMouseEvent(
+                        self.view_id,
+                        synthetic,
+                        point,
+                        keyboard::Modifiers::empty(),
+                    )))
+                } else if is_touch_release(touch_event) {
+                    // Released outside the view — send the release so the engine
+                    // ends any drag state.
+                    Some(shader::Action::publish(Action::SendMouseEvent(
+                        self.view_id,
+                        synthetic,
+                        Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
+                    )))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -798,6 +822,25 @@ where
                     shell.publish(Action::SendMouseEvent(
                         self.id,
                         *event,
+                        Point::ORIGIN,
+                        keyboard::Modifiers::empty(),
+                    ));
+                }
+            }
+            Event::Touch(touch_event) => {
+                // Emulate mouse input for the engine (tap = click, drag = move).
+                let synthetic = touch_to_mouse(touch_event);
+                if let Some(point) = cursor.position_in(layout.bounds()) {
+                    shell.publish(Action::SendMouseEvent(
+                        self.id,
+                        synthetic,
+                        point,
+                        keyboard::Modifiers::empty(),
+                    ));
+                } else if is_touch_release(touch_event) {
+                    shell.publish(Action::SendMouseEvent(
+                        self.id,
+                        synthetic,
                         Point::ORIGIN,
                         keyboard::Modifiers::empty(),
                     ));
