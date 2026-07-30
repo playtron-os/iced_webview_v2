@@ -518,6 +518,9 @@ pub struct Cef {
     /// When `true`, new views block top-level navigation away from their
     /// loaded document (see `set_block_navigation`). Off by default.
     block_navigation: bool,
+    /// `User-Agent` to present, or `None` for the CEF default.
+    /// Applied per view (see `Engine::set_user_agent`).
+    user_agent: Option<String>,
 }
 
 impl Default for Cef {
@@ -535,8 +538,62 @@ impl Default for Cef {
             init_error: None,
             background_color: None,
             block_navigation: false,
+            user_agent: None,
         }
     }
+}
+
+/// Set a browser's `User-Agent` via the DevTools protocol.
+///
+/// CEF has no per-browser UA setter: `Settings.user_agent` is global and fixed
+/// at `initialize()`, which is too early to know which flow will run. The
+/// DevTools `Emulation.setUserAgentOverride` method is the supported per-browser
+/// route, and `send_dev_tools_message` takes the raw JSON directly so no
+/// `DictionaryValue` has to be built.
+///
+/// `Emulation` is used rather than `Network.setUserAgentOverride` because the
+/// latter requires the Network domain to be enabled first.
+///
+/// Best-effort: a failure here means the page loads with the default UA, which
+/// is strictly better than failing to open the view at all.
+fn apply_user_agent(browser: &Browser, user_agent: &str) {
+    let Some(host) = browser.host() else {
+        log::warn!("iced_webview: no browser host; user agent not applied");
+        return;
+    };
+    // `id` is required by the protocol; the reply is not observed. Built by
+    // hand rather than pulling in a JSON dependency for one object — the only
+    // dynamic part is the UA, which is escaped below.
+    let message = format!(
+        r#"{{"id":1,"method":"Emulation.setUserAgentOverride","params":{{"userAgent":"{}"}}}}"#,
+        escape_json(user_agent)
+    );
+
+    if host.send_dev_tools_message(Some(message.as_bytes())) == 0 {
+        log::warn!("iced_webview: failed to set user agent to {user_agent:?}");
+    } else {
+        log::debug!("iced_webview: user agent set to {user_agent:?}");
+    }
+}
+
+/// Escape a string for embedding in a JSON string literal.
+///
+/// A user agent is effectively opaque config from the caller, so it must not be
+/// able to break out of the quotes and forge protocol fields.
+fn escape_json(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Ensure the CEF distribution directory is on `LD_LIBRARY_PATH` so that
@@ -683,6 +740,12 @@ impl Cef {
             None,
             None,
         )?;
+
+        // Apply the UA override before anything is loaded — the browser starts
+        // on `about:blank`, so the first real navigation already carries it.
+        if let Some(user_agent) = &self.user_agent {
+            apply_user_agent(&browser, user_agent);
+        }
 
         Some(CefView {
             id,
@@ -893,6 +956,10 @@ impl Engine for Cef {
 
     fn set_background_color(&mut self, color: u32) {
         self.background_color = Some(color);
+    }
+
+    fn set_user_agent(&mut self, user_agent: Option<String>) {
+        self.user_agent = user_agent;
     }
 
     fn set_block_navigation(&mut self, block: bool) {
@@ -1348,5 +1415,33 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
             Some((vk, ch))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_json;
+
+    /// The user agent is opaque caller config, so it must not be able to break
+    /// out of its JSON string and forge DevTools protocol fields.
+    #[test]
+    fn escapes_json_string_content() {
+        assert_eq!(escape_json("EpicGamesLauncher"), "EpicGamesLauncher");
+        assert_eq!(escape_json(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_json(r"a\b"), r"a\\b");
+        assert_eq!(escape_json("a\nb"), "a\\nb");
+        assert_eq!(escape_json("a\tb"), "a\\tb");
+        // Other control characters take the \u form.
+        assert_eq!(escape_json("a\u{1}b"), "a\\u0001b");
+    }
+
+    #[test]
+    fn an_injected_quote_cannot_forge_a_field() {
+        let hostile = r#"UA","method":"Browser.close"#;
+        let escaped = escape_json(hostile);
+        assert!(
+            !escaped.contains(r#"","method""#),
+            "escaping must neutralise the quote: {escaped}"
+        );
     }
 }

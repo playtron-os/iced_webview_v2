@@ -175,6 +175,17 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Present `user_agent` instead of the engine default.
+    ///
+    /// Applies to views created afterwards, so it can be changed between flows
+    /// — call it before `CreateView`. Some provider login portals gate on the
+    /// UA (Epic Games only reaches its completion redirect for
+    /// `EpicGamesLauncher`), which is why this is per view rather than a
+    /// process-wide setting.
+    pub fn set_user_agent(&mut self, user_agent: Option<String>) {
+        self.engine.set_user_agent(user_agent);
+    }
+
     /// Reads the scale factor detected by the shader viewport and applies it
     /// to the engine if it differs from the current value.
     fn apply_detected_scale(&mut self) {

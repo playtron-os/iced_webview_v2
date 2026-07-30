@@ -117,6 +117,19 @@ pub trait Engine {
     /// engines that don't support it.
     fn set_block_navigation(&mut self, _block: bool) {}
 
+    /// Override the `User-Agent` for views created from now on.
+    ///
+    /// Some sites gate their flow on the UA — Epic Games' account portal only
+    /// reaches its completion redirect for `EpicGamesLauncher`, so a consumer
+    /// driving an OAuth login has to be able to present the UA the provider
+    /// expects. `None` restores the engine default.
+    ///
+    /// Applies per view rather than per process: CEF's global
+    /// `Settings.user_agent` is fixed at `initialize()`, which is too early —
+    /// the required UA isn't known until a specific flow starts, and different
+    /// flows in one session need different values.
+    fn set_user_agent(&mut self, _user_agent: Option<String>) {}
+
     /// Whether this engine can fetch and render URLs natively.
     /// Engines that return `false` rely on the webview layer to fetch HTML.
     fn handles_urls(&self) -> bool {
