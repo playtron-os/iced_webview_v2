@@ -1002,11 +1002,21 @@ impl Engine for Cef {
                     };
                     host.send_key_event(Some(&ke));
                 }
-                // Send CHAR event with the actual text character produced
+                // Send CHAR event with the actual text character produced.
+                //
+                // Fall back to the key's own character when iced reports no
+                // text: numpad digits arrive that way, and without a CHAR event
+                // nothing is inserted — the key looks dead while the top-row
+                // digits work fine.
                 let char_code = text
                     .as_ref()
                     .and_then(|t| t.chars().next())
-                    .map(|c| c as u16);
+                    .map(|c| c as u16)
+                    .or_else(|| {
+                        iced_key_to_cef(key)
+                            .map(|(_, ch)| ch)
+                            .filter(|ch| *ch >= 0x20)
+                    });
                 if let Some(ch) = char_code {
                     let char_event = KeyEvent {
                         size: std::mem::size_of::<KeyEvent>(),
