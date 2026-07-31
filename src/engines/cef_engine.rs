@@ -43,6 +43,9 @@ struct SharedState {
     /// from the loaded document and surfaces them via `popup_url` instead.
     /// Opt-in; off by default so the view behaves like a normal browser.
     block_navigation: bool,
+    /// `User-Agent` to send, or `None` for the engine default. Applied as a
+    /// real request header on every request (see `OsrResourceRequestHandler`).
+    user_agent: Option<String>,
 }
 
 // -- CEF App handler --
@@ -289,6 +292,19 @@ wrap_request_handler! {
         //
         // When the flag is unset (the default) this is a no-op and the view
         // navigates like a normal browser, so other consumers are unaffected.
+        fn resource_request_handler(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _request: Option<&mut Request>,
+            _is_navigation: c_int,
+            _is_download: c_int,
+            _request_initiator: Option<&CefString>,
+            _disable_default_handling: Option<&mut c_int>,
+        ) -> Option<ResourceRequestHandler> {
+            Some(OsrResourceRequestHandler::new(Rc::clone(&self.shared)))
+        }
+
         fn on_before_browse(
             &self,
             _browser: Option<&mut Browser>,
@@ -324,6 +340,39 @@ wrap_request_handler! {
             // the host to open externally.
             self.shared.borrow_mut().popup_url = Some(url);
             1 // non-zero cancels the navigation
+        }
+    }
+}
+
+wrap_resource_request_handler! {
+    struct OsrResourceRequestHandler {
+        shared: Rc<RefCell<SharedState>>,
+    }
+
+    impl ResourceRequestHandler {
+        // Set the User-Agent as a genuine request header, on every request.
+        //
+        // DevTools `Emulation.setUserAgentOverride` also works, but drives
+        // Chromium's *emulation* path: it leaves `navigator.userAgentData` /
+        // Sec-CH-UA reporting the real browser while the UA string claims
+        // otherwise, and it needs the DevTools protocol attached.
+        fn on_before_resource_load(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            request: Option<&mut Request>,
+            _callback: Option<&mut Callback>,
+        ) -> ReturnValue {
+            if let (Some(request), Some(ua)) =
+                (request, self.shared.borrow().user_agent.as_deref())
+            {
+                let name = CefString::from("User-Agent");
+                let value = CefString::from(ua);
+                // `overwrite = 1`: replace Chromium's own header rather than
+                // appending a second one.
+                request.set_header_by_name(Some(&name), Some(&value), 1);
+            }
+            ReturnValue::CONTINUE
         }
     }
 }
@@ -543,59 +592,6 @@ impl Default for Cef {
     }
 }
 
-/// Set a browser's `User-Agent` via the DevTools protocol.
-///
-/// CEF has no per-browser UA setter: `Settings.user_agent` is global and fixed
-/// at `initialize()`, which is too early to know which flow will run. The
-/// DevTools `Emulation.setUserAgentOverride` method is the supported per-browser
-/// route, and `send_dev_tools_message` takes the raw JSON directly so no
-/// `DictionaryValue` has to be built.
-///
-/// `Emulation` is used rather than `Network.setUserAgentOverride` because the
-/// latter requires the Network domain to be enabled first.
-///
-/// Best-effort: a failure here means the page loads with the default UA, which
-/// is strictly better than failing to open the view at all.
-fn apply_user_agent(browser: &Browser, user_agent: &str) {
-    let Some(host) = browser.host() else {
-        log::warn!("iced_webview: no browser host; user agent not applied");
-        return;
-    };
-    // `id` is required by the protocol; the reply is not observed. Built by
-    // hand rather than pulling in a JSON dependency for one object — the only
-    // dynamic part is the UA, which is escaped below.
-    let message = format!(
-        r#"{{"id":1,"method":"Emulation.setUserAgentOverride","params":{{"userAgent":"{}"}}}}"#,
-        escape_json(user_agent)
-    );
-
-    if host.send_dev_tools_message(Some(message.as_bytes())) == 0 {
-        log::warn!("iced_webview: failed to set user agent to {user_agent:?}");
-    } else {
-        log::debug!("iced_webview: user agent set to {user_agent:?}");
-    }
-}
-
-/// Escape a string for embedding in a JSON string literal.
-///
-/// A user agent is effectively opaque config from the caller, so it must not be
-/// able to break out of the quotes and forge protocol fields.
-fn escape_json(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
 /// Ensure the CEF distribution directory is on `LD_LIBRARY_PATH` so that
 /// subprocesses (GPU, renderer, utility) can find `libEGL.so`,
 /// `libGLESv2.so`, and other CEF shared libraries at runtime.
@@ -707,6 +703,7 @@ impl Cef {
             page_loaded: false,
             console_messages: Vec::new(),
             block_navigation: self.block_navigation,
+            user_agent: self.user_agent.clone(),
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
@@ -740,12 +737,6 @@ impl Cef {
             None,
             None,
         )?;
-
-        // Apply the UA override before anything is loaded — the browser starts
-        // on `about:blank`, so the first real navigation already carries it.
-        if let Some(user_agent) = &self.user_agent {
-            apply_user_agent(&browser, user_agent);
-        }
 
         Some(CefView {
             id,
@@ -1425,33 +1416,5 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
             Some((vk, ch))
         }
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::escape_json;
-
-    /// The user agent is opaque caller config, so it must not be able to break
-    /// out of its JSON string and forge DevTools protocol fields.
-    #[test]
-    fn escapes_json_string_content() {
-        assert_eq!(escape_json("EpicGamesLauncher"), "EpicGamesLauncher");
-        assert_eq!(escape_json(r#"a"b"#), r#"a\"b"#);
-        assert_eq!(escape_json(r"a\b"), r"a\\b");
-        assert_eq!(escape_json("a\nb"), "a\\nb");
-        assert_eq!(escape_json("a\tb"), "a\\tb");
-        // Other control characters take the \u form.
-        assert_eq!(escape_json("a\u{1}b"), "a\\u0001b");
-    }
-
-    #[test]
-    fn an_injected_quote_cannot_forge_a_field() {
-        let hostile = r#"UA","method":"Browser.close"#;
-        let escaped = escape_json(hostile);
-        assert!(
-            !escaped.contains(r#"","method""#),
-            "escaping must neutralise the quote: {escaped}"
-        );
     }
 }
