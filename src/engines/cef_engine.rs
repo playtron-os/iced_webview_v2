@@ -975,9 +975,14 @@ impl Engine for Cef {
                 key,
                 text,
                 modifiers,
+                physical_key,
+                location,
+                repeat,
                 ..
             } => {
-                let cef_modifiers = iced_modifiers_to_cef_key(*modifiers);
+                let cef_modifiers =
+                    iced_modifiers_to_cef_key(*modifiers) | key_location_flags(*location, *repeat);
+                let native = physical_key_to_x11(physical_key);
                 // Send RAWKEYDOWN with the unmodified key's virtual key code
                 if let Some((vk, unmod_char)) = iced_key_to_cef(key) {
                     let ke = KeyEvent {
@@ -985,7 +990,7 @@ impl Engine for Cef {
                         type_: KeyEventType::RAWKEYDOWN,
                         modifiers: cef_modifiers,
                         windows_key_code: vk as c_int,
-                        native_key_code: 0,
+                        native_key_code: native,
                         is_system_key: 0,
                         character: unmod_char,
                         unmodified_character: unmod_char,
@@ -1014,7 +1019,7 @@ impl Engine for Cef {
                         type_: KeyEventType::CHAR,
                         modifiers: cef_modifiers,
                         windows_key_code: ch as c_int,
-                        native_key_code: 0,
+                        native_key_code: native,
                         is_system_key: 0,
                         character: ch,
                         unmodified_character: ch,
@@ -1023,15 +1028,25 @@ impl Engine for Cef {
                     host.send_key_event(Some(&char_event));
                 }
             }
-            keyboard::Event::KeyReleased { key, modifiers, .. } => {
-                let cef_modifiers = iced_modifiers_to_cef_key(*modifiers);
+            keyboard::Event::KeyReleased {
+                key,
+                modifiers,
+                physical_key,
+                location,
+                ..
+            } => {
+                // A keyup whose `code`/location disagrees with its keydown is
+                // itself anomalous, so mirror them here.
+                let cef_modifiers =
+                    iced_modifiers_to_cef_key(*modifiers) | key_location_flags(*location, false);
+                let native = physical_key_to_x11(physical_key);
                 if let Some((vk, character)) = iced_key_to_cef(key) {
                     let ke = KeyEvent {
                         size: std::mem::size_of::<KeyEvent>(),
                         type_: KeyEventType::KEYUP,
                         modifiers: cef_modifiers,
                         windows_key_code: vk as c_int,
-                        native_key_code: 0,
+                        native_key_code: native,
                         is_system_key: 0,
                         character,
                         unmodified_character: character,
@@ -1307,12 +1322,159 @@ fn iced_button_to_cef(button: mouse::Button) -> Option<MouseButtonType> {
     }
 }
 
+/// Map a physical key to the X11 hardware keycode CEF expects in
+/// `native_key_code` on Linux.
+///
+/// Chromium derives `KeyboardEvent.code` — the *physical* key, independent of
+/// layout — from this field. Sending 0 leaves `event.code` empty on every
+/// keystroke, which breaks sites that bind to physical keys and is an obvious
+/// automation signal: real Chrome never reports an empty code.
+///
+/// Values are standard X11 keycodes (evdev scancode + 8) for a PC105 layout.
+/// Unknown keys fall back to 0, i.e. exactly the previous behaviour.
+fn physical_key_to_x11(physical: &keyboard::key::Physical) -> c_int {
+    use keyboard::key::{Code, Physical};
+    let Physical::Code(code) = physical else {
+        return 0;
+    };
+    match code {
+        Code::Escape => 9,
+        Code::Digit1 => 10,
+        Code::Digit2 => 11,
+        Code::Digit3 => 12,
+        Code::Digit4 => 13,
+        Code::Digit5 => 14,
+        Code::Digit6 => 15,
+        Code::Digit7 => 16,
+        Code::Digit8 => 17,
+        Code::Digit9 => 18,
+        Code::Digit0 => 19,
+        Code::Minus => 20,
+        Code::Equal => 21,
+        Code::Backspace => 22,
+        Code::Tab => 23,
+        Code::KeyQ => 24,
+        Code::KeyW => 25,
+        Code::KeyE => 26,
+        Code::KeyR => 27,
+        Code::KeyT => 28,
+        Code::KeyY => 29,
+        Code::KeyU => 30,
+        Code::KeyI => 31,
+        Code::KeyO => 32,
+        Code::KeyP => 33,
+        Code::BracketLeft => 34,
+        Code::BracketRight => 35,
+        Code::Enter => 36,
+        Code::ControlLeft => 37,
+        Code::KeyA => 38,
+        Code::KeyS => 39,
+        Code::KeyD => 40,
+        Code::KeyF => 41,
+        Code::KeyG => 42,
+        Code::KeyH => 43,
+        Code::KeyJ => 44,
+        Code::KeyK => 45,
+        Code::KeyL => 46,
+        Code::Semicolon => 47,
+        Code::Quote => 48,
+        Code::Backquote => 49,
+        Code::ShiftLeft => 50,
+        Code::Backslash => 51,
+        Code::KeyZ => 52,
+        Code::KeyX => 53,
+        Code::KeyC => 54,
+        Code::KeyV => 55,
+        Code::KeyB => 56,
+        Code::KeyN => 57,
+        Code::KeyM => 58,
+        Code::Comma => 59,
+        Code::Period => 60,
+        Code::Slash => 61,
+        Code::ShiftRight => 62,
+        Code::NumpadMultiply => 63,
+        Code::AltLeft => 64,
+        Code::Space => 65,
+        Code::CapsLock => 66,
+        Code::F1 => 67,
+        Code::F2 => 68,
+        Code::F3 => 69,
+        Code::F4 => 70,
+        Code::F5 => 71,
+        Code::F6 => 72,
+        Code::F7 => 73,
+        Code::F8 => 74,
+        Code::F9 => 75,
+        Code::F10 => 76,
+        Code::NumLock => 77,
+        Code::ScrollLock => 78,
+        Code::Numpad7 => 79,
+        Code::Numpad8 => 80,
+        Code::Numpad9 => 81,
+        Code::NumpadSubtract => 82,
+        Code::Numpad4 => 83,
+        Code::Numpad5 => 84,
+        Code::Numpad6 => 85,
+        Code::NumpadAdd => 86,
+        Code::Numpad1 => 87,
+        Code::Numpad2 => 88,
+        Code::Numpad3 => 89,
+        Code::Numpad0 => 90,
+        Code::NumpadDecimal => 91,
+        Code::F11 => 95,
+        Code::F12 => 96,
+        Code::NumpadEnter => 104,
+        Code::ControlRight => 105,
+        Code::NumpadDivide => 106,
+        Code::AltRight => 108,
+        Code::Home => 110,
+        Code::ArrowUp => 111,
+        Code::PageUp => 112,
+        Code::ArrowLeft => 113,
+        Code::ArrowRight => 114,
+        Code::End => 115,
+        Code::ArrowDown => 116,
+        Code::PageDown => 117,
+        Code::Insert => 118,
+        Code::Delete => 119,
+        Code::SuperLeft => 133,
+        Code::SuperRight => 134,
+        Code::ContextMenu => 135,
+        _ => 0,
+    }
+}
+
+/// Extra CEF event flags describing *where* a key is, and whether it repeated.
+///
+/// Without these, numpad digits report `KeyboardEvent.location === 0` instead of
+/// 3, left and right modifiers are indistinguishable, and a held key reports
+/// `event.repeat === false` forever.
+fn key_location_flags(location: keyboard::Location, repeat: bool) -> u32 {
+    let mut flags = 0;
+    match location {
+        keyboard::Location::Numpad => flags |= 1 << 9, // EVENTFLAG_IS_KEY_PAD
+        keyboard::Location::Left => flags |= 1 << 10,  // EVENTFLAG_IS_LEFT
+        keyboard::Location::Right => flags |= 1 << 11, // EVENTFLAG_IS_RIGHT
+        keyboard::Location::Standard => {}
+    }
+    if repeat {
+        flags |= 1 << 13; // EVENTFLAG_IS_REPEAT
+    }
+    flags
+}
+
 /// Return the CEF event-flag bit for a held mouse button.
+///
+/// Values are `cef_event_flags_t` from CEF's `internal/cef_types.h`. They were
+/// previously each one bit too high, so a left press arrived as
+/// `EVENTFLAG_MIDDLE_MOUSE_BUTTON`: the page saw `event.button === 0` (left)
+/// together with `event.buttons === 4` (middle), a combination no real mouse
+/// can produce and a cheap automation signal for bot detection.
 fn mouse_button_event_flag(button: mouse::Button) -> u32 {
     match button {
-        mouse::Button::Left => 32,   // EVENTFLAG_LEFT_MOUSE_BUTTON
-        mouse::Button::Middle => 64, // EVENTFLAG_MIDDLE_MOUSE_BUTTON
-        mouse::Button::Right => 128, // EVENTFLAG_RIGHT_MOUSE_BUTTON
+        mouse::Button::Left => 1 << 4,   // EVENTFLAG_LEFT_MOUSE_BUTTON
+        mouse::Button::Middle => 1 << 5, // EVENTFLAG_MIDDLE_MOUSE_BUTTON
+        mouse::Button::Right => 1 << 6,  // EVENTFLAG_RIGHT_MOUSE_BUTTON
         _ => 0,
     }
 }
