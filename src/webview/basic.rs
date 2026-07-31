@@ -106,6 +106,20 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
             .expect("Could find view index for current view. Maybe its already been closed?")
     }
 
+    /// Re-point `current_view_index` after the view at `removed` was dropped.
+    ///
+    /// A dangling index is a latent panic: later lookups (and `view()`, which
+    /// only checks `is_some()`) would index an entry that no longer exists.
+    /// Closing the last view clears it entirely.
+    fn select_view_after_close(&mut self, removed: usize) {
+        self.current_view_index = match self.current_view_index {
+            _ if self.view_ids.is_empty() => None,
+            Some(current) if current > removed => Some(current - 1),
+            Some(current) if current == removed => Some(current.min(self.view_ids.len() - 1)),
+            other => other,
+        };
+    }
+
     fn index_as_view_id(&self, index: u32) -> usize {
         *self
             .view_ids
@@ -325,17 +339,27 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     .request_render(self.index_as_view_id(index), self.view_size);
             }
             Action::CloseCurrentView => {
-                self.engine.remove_view(self.get_current_view_id());
-                self.view_ids.remove(self.current_view_index.expect(
-                    "The current view index is not currently set. Ensure you call the Action prior",
-                ));
+                // A no-op rather than a panic: closing twice is an
+                // ordinary race for a host driving this from app state.
+                let Some(index) = self.current_view_index else {
+                    return Task::batch(tasks);
+                };
+                if let Some(id) = self.view_ids.get(index).copied() {
+                    self.engine.remove_view(id);
+                    self.view_ids.remove(index);
+                }
+                self.select_view_after_close(index);
                 if let Some(on_view_close) = &self.on_close_view {
                     tasks.push(Task::done(on_view_close.clone()));
                 }
             }
             Action::CloseView(index) => {
-                self.engine.remove_view(self.index_as_view_id(index));
-                self.view_ids.remove(index as usize);
+                let index = index as usize;
+                if let Some(id) = self.view_ids.get(index).copied() {
+                    self.engine.remove_view(id);
+                    self.view_ids.remove(index);
+                }
+                self.select_view_after_close(index);
 
                 if let Some(on_view_close) = &self.on_close_view {
                     tasks.push(Task::done(on_view_close.clone()))
