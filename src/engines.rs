@@ -6,6 +6,17 @@ use iced::mouse::{self, Interaction};
 use iced::Point;
 use iced::Size;
 
+/// A completed `eval` requested by the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalResult {
+    /// Matches the id returned by `Engine::evaluate_javascript`.
+    pub id: u32,
+    /// The value as a string, or the exception message when `ok` is false.
+    pub value: String,
+    /// Whether the script ran without throwing.
+    pub ok: bool,
+}
+
 /// A Blitz implementation of Engine (Stylo + Taffy + Vello)
 #[cfg(feature = "blitz")]
 pub mod blitz;
@@ -136,6 +147,28 @@ pub trait Engine {
     /// For CEF this is process-wide and fixed when the browser starts, so
     /// set it before creating the first view.
     fn set_locale(&mut self, _locale: Option<String>) {}
+
+    /// Run `code` and deliver its value back through
+    /// [`take_eval_results`](Self::take_eval_results), tagged with `request_id`.
+    ///
+    /// Unlike [`execute_javascript`](Self::execute_javascript), which is
+    /// fire-and-forget. Only the render process has a JS context, so the value
+    /// crosses IPC and arrives on a later update. Everything comes back as a
+    /// string — `JSON.stringify` in the script if you need structure.
+    fn evaluate_javascript(&mut self, _id: ViewId, _code: &str, _request_id: u32) {}
+
+    /// Take any results that have arrived since the last call.
+    fn take_eval_results(&mut self, _id: ViewId) -> Vec<EvalResult> {
+        Vec::new()
+    }
+
+    /// Whether the focused element accepts text.
+    ///
+    /// The cue for raising an on-screen keyboard — there is otherwise no way
+    /// to know the user entered a text field.
+    fn has_editable_focus(&self, _id: ViewId) -> bool {
+        false
+    }
 
     /// Whether this engine can fetch and render URLs natively.
     /// Engines that return `false` rely on the webview layer to fetch HTML.

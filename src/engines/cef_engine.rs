@@ -10,6 +10,7 @@ use iced::{Point, Size};
 use rand::Rng;
 
 use super::{ConsoleMessage, Engine, PageType, PixelFormat, ViewId};
+use crate::engines::EvalResult;
 use crate::ImageInfo;
 
 // Pull in all CEF types, traits, and macros. The wrap_*! macros reference
@@ -49,6 +50,11 @@ struct SharedState {
     /// Where the native popup (a `<select>` list, autofill menu) sits, in view
     /// coordinates, while it is showing.
     popup_rect: Option<(u32, u32, u32, u32)>,
+    /// Completed `evaluate_javascript` results, drained by the webview layer.
+    eval_results: Vec<EvalResult>,
+    /// Whether the focused DOM node accepts text — the cue a host needs to
+    /// raise an on-screen keyboard.
+    editable_focus: bool,
 }
 
 impl OsrRenderHandler {
@@ -92,12 +98,142 @@ impl OsrRenderHandler {
     }
 }
 
+/// Process-message names for the browser↔renderer bridge.
+///
+/// CEF's `ExecuteJavaScript` is fire-and-forget: only the render process has a
+/// V8 context, so getting a *value* back means asking it over IPC. The same
+/// channel carries the focused-node signal, which likewise only the renderer
+/// can see.
+mod ipc {
+    /// browser → renderer: `[request_id, script]`
+    pub const EVAL: &str = "iced_webview.eval";
+    /// renderer → browser: `[request_id, ok, value_or_error]`
+    pub const EVAL_RESULT: &str = "iced_webview.eval_result";
+    /// renderer → browser: `[is_editable]`
+    pub const FOCUS: &str = "iced_webview.focus_changed";
+}
+
+/// Flatten a JS value to a string for the trip across IPC.
+///
+/// Strings, numbers and bools survive; anything structured has no faithful
+/// string form and is the caller's job to `JSON.stringify` in-script.
+fn v8_value_to_string(value: V8Value) -> String {
+    if value.is_string() != 0 {
+        CefString::from(&value.string_value()).to_string()
+    } else if value.is_bool() != 0 {
+        (value.bool_value() != 0).to_string()
+    } else if value.is_int() != 0 {
+        value.int_value().to_string()
+    } else if value.is_uint() != 0 {
+        value.uint_value().to_string()
+    } else if value.is_double() != 0 {
+        value.double_value().to_string()
+    } else if value.is_null() != 0 || value.is_undefined() != 0 {
+        String::new()
+    } else {
+        // Objects/arrays/functions: `string_value()` is empty for these, so say
+        // so rather than returning a silent empty string.
+        "[unserializable value \u{2014} JSON.stringify in the script]".to_owned()
+    }
+}
+
+wrap_render_process_handler! {
+    struct OsrRenderProcessHandler;
+
+    impl RenderProcessHandler {
+        // Runs in the *render* process, which is the only place a V8 context
+        // exists. Evaluates the script and ships the result back.
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> c_int {
+            let Some(message) = message else { return 0 };
+            if CefString::from(&message.name()).to_string() != ipc::EVAL {
+                return 0;
+            }
+            let Some(args) = message.argument_list() else { return 0 };
+            let id = args.int(0);
+            let script = CefString::from(&args.string(1)).to_string();
+            let Some(frame) = frame else { return 0 };
+
+            // The frame's own context, not `v8_context_get_current_context()`:
+            // that one is only non-null while JS is on the stack, and an IPC
+            // callback is not.
+            let (ok, value) = match frame.v8_context().filter(|ctx| ctx.is_valid() != 0) {
+                Some(ctx) => {
+                    let mut retval = None;
+                    let mut exception = None;
+                    let ran = ctx.eval(
+                        Some(&CefString::from(script.as_str())),
+                        None,
+                        0,
+                        Some(&mut retval),
+                        Some(&mut exception),
+                    );
+                    if ran == 0 {
+                        let msg = exception
+                            .map(|e| CefString::from(&e.message()).to_string())
+                            .filter(|m| !m.is_empty())
+                            .unwrap_or_else(|| "script raised an exception".to_owned());
+                        (false, msg)
+                    } else {
+                        (true, retval.map(v8_value_to_string).unwrap_or_default())
+                    }
+                }
+                None => (false, "no V8 context in this frame".to_owned()),
+            };
+
+            if let Some(mut reply) =
+                process_message_create(Some(&CefString::from(ipc::EVAL_RESULT)))
+            {
+                if let Some(out) = reply.argument_list() {
+                    out.set_int(0, id);
+                    out.set_bool(1, i32::from(ok));
+                    out.set_string(2, Some(&CefString::from(value.as_str())));
+                }
+                frame.send_process_message(ProcessId::BROWSER, Some(&mut reply));
+            }
+            1
+        }
+
+        // The host needs this to know when to raise an on-screen keyboard:
+        // on a gamepad-only device there is no other way to tell that the user
+        // just focused a text field.
+        fn on_focused_node_changed(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            node: Option<&mut Domnode>,
+        ) {
+            let editable = node.is_some_and(|n| n.is_editable() != 0);
+            if let (Some(frame), Some(mut msg)) = (
+                frame,
+                process_message_create(Some(&CefString::from(ipc::FOCUS))),
+            ) {
+                if let Some(args) = msg.argument_list() {
+                    args.set_bool(0, i32::from(editable));
+                }
+                frame.send_process_message(ProcessId::BROWSER, Some(&mut msg));
+            }
+        }
+    }
+}
+
 // -- CEF App handler --
 
 wrap_app! {
     struct OsrApp;
 
     impl App {
+        // CEF instantiates the app in every process; this one is only consulted
+        // in the render process, where the V8 context lives.
+        fn render_process_handler(&self) -> Option<RenderProcessHandler> {
+            Some(OsrRenderProcessHandler::new())
+        }
+
         fn on_before_command_line_processing(
             &self,
             process_type: Option<&CefString>,
@@ -560,9 +696,42 @@ wrap_client! {
         load_handler: LoadHandler,
         request_handler: RequestHandler,
         dialog_handler: DialogHandler,
+        shared: Rc<RefCell<SharedState>>,
     }
 
     impl Client {
+        // Receives what the render process sends back: eval results and the
+        // focused-node signal.
+        fn on_process_message_received(
+            &self,
+            _browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _source_process: ProcessId,
+            message: Option<&mut ProcessMessage>,
+        ) -> c_int {
+            let Some(message) = message else { return 0 };
+            let name = CefString::from(&message.name()).to_string();
+            let Some(args) = message.argument_list() else { return 0 };
+
+            match name.as_str() {
+                ipc::EVAL_RESULT => {
+                    let id = u32::try_from(args.int(0)).unwrap_or(0);
+                    let ok = args.bool(1) != 0;
+                    let value = CefString::from(&args.string(2)).to_string();
+                    self.shared
+                        .borrow_mut()
+                        .eval_results
+                        .push(EvalResult { id, value, ok });
+                    1
+                }
+                ipc::FOCUS => {
+                    self.shared.borrow_mut().editable_focus = args.bool(0) != 0;
+                    1
+                }
+                _ => 0,
+            }
+        }
+
         fn render_handler(&self) -> Option<RenderHandler> {
             Some(self.render_handler.clone())
         }
@@ -902,6 +1071,8 @@ impl Cef {
             block_navigation: self.block_navigation,
             user_agent: self.user_agent.clone(),
             popup_rect: None,
+            eval_results: Vec::new(),
+            editable_focus: false,
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
@@ -917,6 +1088,7 @@ impl Cef {
             load_handler,
             request_handler,
             dialog_handler,
+            Rc::clone(&shared),
         );
 
         let window_info = WindowInfo::default().set_as_windowless(0);
@@ -1423,6 +1595,34 @@ impl Engine for Cef {
         };
         let cef_code = CefString::from(code);
         frame.execute_java_script(Some(&cef_code), None, 0);
+    }
+
+    fn evaluate_javascript(&mut self, id: ViewId, code: &str, request_id: u32) {
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
+        let Some(frame) = view.browser.main_frame() else {
+            return;
+        };
+        let Some(mut msg) = process_message_create(Some(&CefString::from(ipc::EVAL))) else {
+            return;
+        };
+        if let Some(args) = msg.argument_list() {
+            args.set_int(0, i32::try_from(request_id).unwrap_or(0));
+            args.set_string(1, Some(&CefString::from(code)));
+        }
+        frame.send_process_message(ProcessId::RENDERER, Some(&mut msg));
+    }
+
+    fn take_eval_results(&mut self, id: ViewId) -> Vec<EvalResult> {
+        self.find_view_mut(id)
+            .map(|view| std::mem::take(&mut view.shared.borrow_mut().eval_results))
+            .unwrap_or_default()
+    }
+
+    fn has_editable_focus(&self, id: ViewId) -> bool {
+        self.find_view(id)
+            .is_some_and(|view| view.shared.borrow().editable_focus)
     }
 
     fn refresh(&mut self, id: ViewId) {

@@ -17,6 +17,7 @@ use iced::{Event, Length, Rectangle};
 use crate::webview::{is_touch_release, touch_to_mouse};
 use url::Url;
 
+use crate::engines::EvalResult;
 use crate::{engines, ImageInfo, PageType, ViewId};
 
 #[allow(missing_docs)]
@@ -94,9 +95,19 @@ where
     nav_epochs: HashMap<ViewId, u64>,
     /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
     detected_scale: Arc<AtomicU32>,
+    /// Counter handing out ids for `evaluate_javascript` round trips.
+    next_eval_id: u32,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView<Engine, Message> {
+    /// The current view, or `None` when there isn't one.
+    ///
+    /// The non-panicking counterpart to `get_current_view_id`, for callers that
+    /// can be reached before a view exists or after the last one closed.
+    fn current_view_id(&self) -> Option<ViewId> {
+        self.view_ids.get(self.current_view_index?).copied()
+    }
+
     fn get_current_view_id(&self) -> ViewId {
         *self
             .view_ids
@@ -155,6 +166,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             inflight_images: 0,
             nav_epochs: HashMap::new(),
             detected_scale: Arc::new(AtomicU32::new(0)),
+            next_eval_id: 0,
         }
     }
 }
@@ -206,6 +218,33 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     /// before the first view is created.
     pub fn set_locale(&mut self, locale: Option<String>) {
         self.engine.set_locale(locale);
+    }
+
+    /// Run `script` in the current view and get its value back.
+    ///
+    /// Returns the id to match against
+    /// [`take_eval_results`](Self::take_eval_results); the value arrives on a
+    /// later update, not from this call. `None` when no view is open.
+    pub fn evaluate_javascript(&mut self, script: &str) -> Option<u32> {
+        let view_id = self.current_view_id()?;
+        self.next_eval_id = self.next_eval_id.wrapping_add(1);
+        let id = self.next_eval_id;
+        self.engine.evaluate_javascript(view_id, script, id);
+        Some(id)
+    }
+
+    /// Take the eval results that have arrived since the last call.
+    pub fn take_eval_results(&mut self) -> Vec<EvalResult> {
+        let Some(view_id) = self.current_view_id() else {
+            return Vec::new();
+        };
+        self.engine.take_eval_results(view_id)
+    }
+
+    /// Whether the focused element in the current view accepts text.
+    pub fn has_editable_focus(&self) -> bool {
+        self.current_view_id()
+            .is_some_and(|view_id| self.engine.has_editable_focus(view_id))
     }
 
     /// Reads the scale factor detected by the shader viewport and applies it
