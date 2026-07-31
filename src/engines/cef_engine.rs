@@ -578,6 +578,13 @@ static CEF_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static CEF_INIT_ERROR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 /// Run CEF global initialization exactly once. Returns `(success, error)`.
+/// Locale requested before CEF starts, read once by [`ensure_cef_initialized`].
+///
+/// `Accept-Language` and the UI locale live on `CefSettings` and are fixed at
+/// `initialize()`, so this is process-wide rather than per view. Init is
+/// deferred to the first view so a host can learn the user's language first.
+static PENDING_LOCALE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
     let error = CEF_INIT_ERROR.get_or_init(|| {
         let _ = api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
@@ -611,7 +618,20 @@ fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
         let locales_dir = cef_dir.join("locales");
         let locales_str = locales_dir.to_string_lossy();
 
+        let requested_locale = PENDING_LOCALE
+            .lock()
+            .ok()
+            .and_then(|l| l.clone())
+            .unwrap_or_default();
+        let accept_language = if requested_locale.is_empty() {
+            String::new()
+        } else {
+            format!("{requested_locale},en")
+        };
+
         let settings = Settings {
+            locale: CefString::from(requested_locale.as_str()),
+            accept_language_list: CefString::from(accept_language.as_str()),
             windowless_rendering_enabled: 1,
             external_message_pump: 1,
             no_sandbox: 1,
@@ -672,6 +692,9 @@ pub struct Cef {
     /// `User-Agent` to present, or `None` for the CEF default.
     /// Applied per view (see `Engine::set_user_agent`).
     user_agent: Option<String>,
+    /// BCP-47 language for `Accept-Language`, or `None` for the CEF default.
+    /// Process-wide, so it must be set before the first view is created.
+    locale: Option<String>,
 }
 
 impl Default for Cef {
@@ -690,6 +713,7 @@ impl Default for Cef {
             background_color: None,
             block_navigation: false,
             user_agent: None,
+            locale: None,
         }
     }
 }
@@ -1061,6 +1085,19 @@ impl Engine for Cef {
 
     fn set_user_agent(&mut self, user_agent: Option<String>) {
         self.user_agent = user_agent;
+    }
+
+    fn set_locale(&mut self, locale: Option<String>) {
+        if CEF_INITIALIZED.load(std::sync::atomic::Ordering::Relaxed) {
+            log::warn!(
+                "iced_webview: locale set after CEF started; \
+                 Accept-Language is fixed at init and will not change"
+            );
+        }
+        if let Ok(mut pending) = PENDING_LOCALE.lock() {
+            *pending = locale.clone();
+        }
+        self.locale = locale;
     }
 
     fn set_block_navigation(&mut self, block: bool) {

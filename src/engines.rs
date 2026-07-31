@@ -130,6 +130,13 @@ pub trait Engine {
     /// flows in one session need different values.
     fn set_user_agent(&mut self, _user_agent: Option<String>) {}
 
+    /// Set the language to request from sites (`Accept-Language`, and the
+    /// browser UI locale where the engine has one).
+    ///
+    /// For CEF this is process-wide and fixed when the browser starts, so
+    /// set it before creating the first view.
+    fn set_locale(&mut self, _locale: Option<String>) {}
+
     /// Whether this engine can fetch and render URLs natively.
     /// Engines that return `false` rely on the webview layer to fetch HTML.
     fn handles_urls(&self) -> bool {

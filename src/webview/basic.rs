@@ -200,6 +200,14 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.set_user_agent(user_agent);
     }
 
+    /// Request `locale` from sites via `Accept-Language`.
+    ///
+    /// Process-wide for CEF and fixed once the browser starts, so call it
+    /// before the first view is created.
+    pub fn set_locale(&mut self, locale: Option<String>) {
+        self.engine.set_locale(locale);
+    }
+
     /// Reads the scale factor detected by the shader viewport and applies it
     /// to the engine if it differs from the current value.
     fn apply_detected_scale(&mut self) {
