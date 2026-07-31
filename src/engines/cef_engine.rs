@@ -46,6 +46,50 @@ struct SharedState {
     /// `User-Agent` to send, or `None` for the engine default. Applied as a
     /// real request header on every request (see `OsrResourceRequestHandler`).
     user_agent: Option<String>,
+    /// Where the native popup (a `<select>` list, autofill menu) sits, in view
+    /// coordinates, while it is showing.
+    popup_rect: Option<(u32, u32, u32, u32)>,
+}
+
+impl OsrRenderHandler {
+    /// Composite a `PET_POPUP` pass over the page buffer at the popup's rect.
+    ///
+    /// The popup buffer is its own small BGRA image; the page buffer is
+    /// untouched underneath, so closing the popup (which clears `popup_rect`)
+    /// lets the next page paint restore what was covered.
+    fn blit_popup(&self, buffer: *const u8, width: c_int, height: c_int) {
+        let (pw, ph) = (width.max(0) as usize, height.max(0) as usize);
+        if pw == 0 || ph == 0 {
+            return;
+        }
+        let mut shared = self.shared.borrow_mut();
+        let Some((px, py, _, _)) = shared.popup_rect else {
+            return; // no rect yet — nothing to place it against
+        };
+        let (vw, vh) = shared.persistent_size;
+        let (vw, vh) = (vw as usize, vh as usize);
+        if vw == 0 || vh == 0 {
+            return;
+        }
+
+        let src = unsafe { std::slice::from_raw_parts(buffer, pw * ph * 4) };
+        let dst = Arc::make_mut(&mut shared.persistent_buffer);
+        let (px, py) = (px as usize, py as usize);
+
+        for row in 0..ph {
+            let dy = py + row;
+            if dy >= vh {
+                break;
+            }
+            let copy_w = pw.min(vw.saturating_sub(px));
+            if copy_w == 0 {
+                break;
+            }
+            let s0 = row * pw * 4;
+            let d0 = (dy * vw + px) * 4;
+            dst[d0..d0 + copy_w * 4].copy_from_slice(&src[s0..s0 + copy_w * 4]);
+        }
+    }
 }
 
 // -- CEF App handler --
@@ -142,15 +186,42 @@ wrap_render_handler! {
             0
         }
 
+        // Track where a native popup (a `<select>` list, autofill menu) sits,
+        // and whether it is up. CEF paints those in a *separate* `PET_POPUP`
+        // pass with its own small buffer, so `on_paint` needs both to composite
+        // rather than treat it as a new page.
+        fn on_popup_show(&self, _browser: Option<&mut Browser>, show: c_int) {
+            if show == 0 {
+                self.shared.borrow_mut().popup_rect = None;
+            }
+        }
+
+        fn on_popup_size(&self, _browser: Option<&mut Browser>, rect: Option<&Rect>) {
+            if let Some(r) = rect {
+                let clamp = |v: c_int| u32::try_from(v.max(0)).unwrap_or(0);
+                self.shared.borrow_mut().popup_rect =
+                    Some((clamp(r.x), clamp(r.y), clamp(r.width), clamp(r.height)));
+            }
+        }
+
         fn on_paint(
             &self,
             _browser: Option<&mut Browser>,
-            _type_: PaintElementType,
+            type_: PaintElementType,
             dirty_rects: Option<&[Rect]>,
             buffer: *const u8,
             width: c_int,
             height: c_int,
         ) {
+            // A popup pass carries only the dropdown's own pixels, at its own
+            // size. Blitting it over the page keeps both; treating it as the
+            // page (what happened before) replaced the whole texture with the
+            // dropdown, so opening a `<select>` made the page vanish.
+            if type_ == PaintElementType::POPUP {
+                self.blit_popup(buffer, width, height);
+                return;
+            }
+
             let w = width as u32;
             let h = height as u32;
             let stride = (w as usize) * 4;
@@ -830,6 +901,7 @@ impl Cef {
             console_messages: Vec::new(),
             block_navigation: self.block_navigation,
             user_agent: self.user_agent.clone(),
+            popup_rect: None,
         }));
 
         let render_handler = OsrRenderHandler::new(Rc::clone(&shared));
