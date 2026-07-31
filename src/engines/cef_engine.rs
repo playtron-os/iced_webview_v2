@@ -241,26 +241,27 @@ wrap_app! {
         ) {
             let Some(cmd) = command_line else { return };
 
-            // Forcing `ozone-platform=headless` + `disable-gpu` +
-            // `in-process-gpu` dodges a GLX BadMatch against the host wgpu
-            // context, but drops WebGL onto SwiftShader. Set
-            // `ICED_WEBVIEW_DISABLE_GPU=1` to restore those if a host hits the
-            // conflict.
+            // OSR delivers pixels through `on_paint`, so CEF must never bring up
+            // a real windowing platform: besides conflicting with the host iced
+            // app's display connection, a real platform breaks HiDPI. Chromium
+            // then takes the device scale factor from the *platform screen*
+            // (1x under XWayland) and ignores the one `GetScreenInfo` reports
+            // below, so the page rasterizes at 1x and gets upscaled into the
+            // widget — visibly blurry on every scaled display.
+            cmd.append_switch_with_value(
+                Some(&CefString::from("ozone-platform")),
+                Some(&CefString::from("headless")),
+            );
+
+            // Headless ozone still reaches the GPU through EGL surfaceless, so
+            // WebGL stays hardware-accelerated. `ICED_WEBVIEW_DISABLE_GPU=1`
+            // forces SwiftShader for hosts where the GL context still conflicts.
             let disable_gpu = std::env::var("ICED_WEBVIEW_DISABLE_GPU")
                 .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
 
             if disable_gpu {
-                cmd.append_switch_with_value(
-                    Some(&CefString::from("ozone-platform")),
-                    Some(&CefString::from("headless")),
-                );
                 cmd.append_switch(Some(&CefString::from("disable-gpu")));
                 cmd.append_switch(Some(&CefString::from("in-process-gpu")));
-            } else {
-                cmd.append_switch_with_value(
-                    Some(&CefString::from("ozone-platform-hint")),
-                    Some(&CefString::from("x11")),
-                );
             }
 
             // Don't probe the system keyring (gnome-keyring / kwallet) over
