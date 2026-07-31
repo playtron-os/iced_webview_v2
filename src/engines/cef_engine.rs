@@ -273,7 +273,57 @@ wrap_load_handler! {
                 self.shared.borrow_mut().page_loaded = true;
             }
         }
+
+        // Off-screen rendering has no window manager handing focus back, so
+        // without this a page reached by redirect drops keystrokes until the
+        // user clicks inside it.
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            _frame: Option<&mut Frame>,
+            _http_status_code: c_int,
+        ) {
+            if let Some(host) = browser.and_then(|b| b.host()) {
+                host.set_focus(1);
+            }
+        }
+
+        // Render the error inline; otherwise a failed load is a blank
+        // rectangle with nothing to retry.
+        fn on_load_error(
+            &self,
+            _browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            error_code: Errorcode,
+            error_text: Option<&CefString>,
+            failed_url: Option<&CefString>,
+        ) {
+            let text = error_text.map(ToString::to_string).unwrap_or_default();
+            let url = failed_url.map(ToString::to_string).unwrap_or_default();
+            log::warn!("iced_webview: load failed ({error_code:?}) for {url}: {text}");
+
+            let Some(frame) = frame else { return };
+            let body = format!(
+                "<html><body style=\"font-family:sans-serif;padding:2rem\">\
+                 <h2>Failed to load</h2><p>{}</p><p style=\"color:#666\">{}</p></body></html>",
+                html_escape(&url),
+                html_escape(&text),
+            );
+            let data_url = format!(
+                "data:text/html;charset=utf-8,{}",
+                urlencoding::encode(&body)
+            );
+            frame.load_url(Some(&CefString::from(data_url.as_str())));
+        }
     }
+}
+
+/// Minimal HTML escaping for text interpolated into the error page.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 wrap_request_handler! {
@@ -737,6 +787,14 @@ impl Cef {
             None,
             None,
         )?;
+
+        // Give the new browser host focus immediately. Off-screen rendering has
+        // no window manager to do it, so without this the renderer discards
+        // every key event until the user physically clicks inside the view —
+        // i.e. a portal you are supposed to type an email into looks dead.
+        if let Some(host) = browser.host() {
+            host.set_focus(1);
+        }
 
         Some(CefView {
             id,
