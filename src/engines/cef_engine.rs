@@ -261,7 +261,7 @@ wrap_life_span_handler! {
         fn on_before_close(&self, _browser: Option<&mut Browser>) {}
         fn on_before_popup(
             &self,
-            _browser: Option<&mut Browser>,
+            browser: Option<&mut Browser>,
             _frame: Option<&mut Frame>,
             _popup_id: c_int,
             target_url: Option<&CefString>,
@@ -275,12 +275,35 @@ wrap_life_span_handler! {
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut c_int>,
         ) -> c_int {
-            // Cancel the popup and route the URL through on_url_change instead
-            if let Some(url) = target_url {
-                let url_str = url.to_string();
-                self.shared.borrow_mut().popup_url = Some(url_str);
+            let Some(url) = target_url else {
+                return 1; // nothing to open
+            };
+
+            // Single-document viewers opt out of navigating at all: hand the
+            // URL to the host so it can open it externally.
+            if self.shared.borrow().block_navigation {
+                self.shared.borrow_mut().popup_url = Some(url.to_string());
+                return 1;
             }
-            1 // non-zero cancels the popup
+
+            // Otherwise load the target here rather than dropping it: a
+            // cancelled popup with no follow-up makes every `window.open` /
+            // `target="_blank"` control a dead button. Opener semantics
+            // (`window.close()`, `postMessage`) are not preserved.
+            //
+            // Deliberately not also setting `popup_url` — that is the host's
+            // "open this elsewhere" channel, and doing both loads the page
+            // twice.
+            match browser.and_then(|b| b.main_frame()) {
+                Some(frame) => {
+                    log::debug!("iced_webview: popup navigated in place: {url}");
+                    frame.load_url(Some(url));
+                }
+                // No frame to navigate — fall back to handing it to the host
+                // rather than silently dropping it.
+                None => self.shared.borrow_mut().popup_url = Some(url.to_string()),
+            }
+            1 // the popup itself is cancelled; we handled the URL
         }
     }
 }
