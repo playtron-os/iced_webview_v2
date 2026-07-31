@@ -56,28 +56,57 @@ wrap_app! {
     impl App {
         fn on_before_command_line_processing(
             &self,
-            _process_type: Option<&CefString>,
+            process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
-            if let Some(cmd) = command_line {
-                // OSR renders to a pixel buffer — use headless ozone so
-                // CEF doesn't try to connect to X11 or Wayland (which
-                // would conflict with the host iced app's display).
+            let Some(cmd) = command_line else { return };
+
+            // Forcing `ozone-platform=headless` + `disable-gpu` +
+            // `in-process-gpu` dodges a GLX BadMatch against the host wgpu
+            // context, but drops WebGL onto SwiftShader. Set
+            // `ICED_WEBVIEW_DISABLE_GPU=1` to restore those if a host hits the
+            // conflict.
+            let disable_gpu = std::env::var("ICED_WEBVIEW_DISABLE_GPU")
+                .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
+
+            if disable_gpu {
                 cmd.append_switch_with_value(
                     Some(&CefString::from("ozone-platform")),
                     Some(&CefString::from("headless")),
                 );
-
-                // OSR delivers pixels via on_paint(). GPU compositing
-                // inside CEF requires its own GL context, which conflicts
-                // with the host iced app's wgpu context on X11 (GLX
-                // BadMatch). Disable it and run remaining GL calls
-                // in-process so the GPU subprocess doesn't need real
-                // driver access (containers, Flatpak).
                 cmd.append_switch(Some(&CefString::from("disable-gpu")));
-                cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
                 cmd.append_switch(Some(&CefString::from("in-process-gpu")));
+            } else {
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform-hint")),
+                    Some(&CefString::from("x11")),
+                );
             }
+
+            // Don't probe the system keyring (gnome-keyring / kwallet) over
+            // D-Bus during browser-process startup.
+            cmd.append_switch_with_value(
+                Some(&CefString::from("password-store")),
+                Some(&CefString::from("basic")),
+            );
+
+            // The rest are browser-process only.
+            let is_browser_process = process_type.is_none_or(|t| t.to_string().is_empty());
+            if !is_browser_process {
+                return;
+            }
+
+            // Keeps the OSR texture from glitching on resize — this is
+            // what actually fixes the context conflict.
+            cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+            cmd.append_switch(Some(&CefString::from("disable-gpu-shader-disk-cache")));
+            cmd.append_switch(Some(&CefString::from("enable-accelerated-2d-canvas")));
+            cmd.append_switch_with_value(
+                Some(&CefString::from("enable-features")),
+                Some(&CefString::from(
+                    "CanvasOopRasterization,UserAgentClientHints,GreaseUACH",
+                )),
+            );
         }
     }
 }
