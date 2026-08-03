@@ -44,9 +44,6 @@ struct SharedState {
     /// from the loaded document and surfaces them via `popup_url` instead.
     /// Opt-in; off by default so the view behaves like a normal browser.
     block_navigation: bool,
-    /// `User-Agent` to send, or `None` for the engine default. Applied as a
-    /// real request header on every request (see `OsrResourceRequestHandler`).
-    user_agent: Option<String>,
     /// Where the native popup (a `<select>` list, autofill menu) sits, in view
     /// coordinates, while it is showing.
     popup_rect: Option<(u32, u32, u32, u32)>,
@@ -589,6 +586,19 @@ fn html_escape(value: &str) -> String {
 wrap_request_handler! {
     struct OsrRequestHandler {
         shared: Rc<RefCell<SharedState>>,
+        // `User-Agent` to send, or `None` for the engine default.
+        //
+        // Snapshotted on the UI thread at view creation, and deliberately NOT
+        // stored in `SharedState`: the only consumer is
+        // `OsrResourceRequestHandler`, whose callbacks CEF makes on the
+        // browser-process IO thread. `SharedState` lives behind an
+        // `Rc<RefCell<_>>` owned by the UI/pump thread, so reading it from
+        // there raced `Engine::update`'s `borrow_mut`. An `Arc<str>` is
+        // `Send + Sync` and costs one atomic bump per request to hand across.
+        //
+        // Snapshot-at-creation is exactly the previous semantics:
+        // `Engine::set_user_agent` never propagated to live views either.
+        user_agent: Option<Arc<str>>,
     }
 
     impl RequestHandler {
@@ -612,7 +622,11 @@ wrap_request_handler! {
             _request_initiator: Option<&CefString>,
             _disable_default_handling: Option<&mut c_int>,
         ) -> Option<ResourceRequestHandler> {
-            Some(OsrResourceRequestHandler::new(Rc::clone(&self.shared)))
+            // CEF calls this on the browser-process IO thread, so it must not
+            // touch `self.shared` — cloning the `Rc` here was a non-atomic
+            // refcount bump racing the UI thread. `Option<Arc<str>>` is the
+            // whole payload the resource handler needs.
+            Some(OsrResourceRequestHandler::new(self.user_agent.clone()))
         }
 
         fn on_before_browse(
@@ -656,7 +670,10 @@ wrap_request_handler! {
 
 wrap_resource_request_handler! {
     struct OsrResourceRequestHandler {
-        shared: Rc<RefCell<SharedState>>,
+        // Owned snapshot — see `OsrRequestHandler::user_agent`. Every method
+        // on this handler runs on the IO thread, so it must hold no `Rc` and
+        // no reference into `SharedState`.
+        user_agent: Option<Arc<str>>,
     }
 
     impl ResourceRequestHandler {
@@ -673,9 +690,7 @@ wrap_resource_request_handler! {
             request: Option<&mut Request>,
             _callback: Option<&mut Callback>,
         ) -> ReturnValue {
-            if let (Some(request), Some(ua)) =
-                (request, self.shared.borrow().user_agent.as_deref())
-            {
+            if let (Some(request), Some(ua)) = (request, self.user_agent.as_deref()) {
                 let name = CefString::from("User-Agent");
                 let value = CefString::from(ua);
                 // `overwrite = 1`: replace Chromium's own header rather than
@@ -1070,7 +1085,6 @@ impl Cef {
             page_loaded: false,
             console_messages: Vec::new(),
             block_navigation: self.block_navigation,
-            user_agent: self.user_agent.clone(),
             popup_rect: None,
             eval_results: Vec::new(),
             editable_focus: false,
@@ -1080,7 +1094,10 @@ impl Cef {
         let display_handler = OsrDisplayHandler::new(Rc::clone(&shared));
         let life_span_handler = OsrLifeSpanHandler::new(Rc::clone(&shared));
         let load_handler = OsrLoadHandler::new(Rc::clone(&shared));
-        let request_handler = OsrRequestHandler::new(Rc::clone(&shared));
+        let request_handler = OsrRequestHandler::new(
+            Rc::clone(&shared),
+            self.user_agent.as_deref().map(Arc::from),
+        );
         let dialog_handler = OsrDialogHandler::new();
         let mut client = OsrClient::new(
             render_handler,
