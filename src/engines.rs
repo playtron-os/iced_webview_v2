@@ -29,6 +29,10 @@ pub mod litehtml;
 #[cfg(feature = "servo")]
 pub mod servo;
 
+/// Zero-copy delivery of rendered frames as GPU textures (dmabuf import)
+#[cfg(feature = "cef")]
+pub mod accelerated;
+
 /// CEF file dialog handler (zenity-based native file picker)
 #[cfg(feature = "cef")]
 mod cef_dialog;

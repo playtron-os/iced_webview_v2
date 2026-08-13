@@ -66,6 +66,12 @@ pub struct ImageInfo {
     /// and the pixel-buffer clone it requires are avoided entirely.
     handle: std::sync::OnceLock<image::Handle>,
     raw_pixels: Arc<Vec<u8>>,
+    /// Set when the frame lives on the GPU instead of in `raw_pixels`, which
+    /// is then empty. Carried here so the surface reaches the shader through
+    /// the same path a CPU frame takes, rather than threading a second
+    /// argument through every engine and widget signature.
+    #[cfg(feature = "cef")]
+    accelerated: Option<Arc<crate::engines::accelerated::AcceleratedSurface>>,
 }
 
 impl Default for ImageInfo {
@@ -78,6 +84,8 @@ impl Default for ImageInfo {
             pixel_format: PixelFormat::Rgba,
             handle: std::sync::OnceLock::new(),
             raw_pixels,
+            #[cfg(feature = "cef")]
+            accelerated: None,
         }
     }
 }
@@ -108,7 +116,38 @@ impl ImageInfo {
             pixel_format: format,
             handle: std::sync::OnceLock::new(),
             raw_pixels,
+            #[cfg(feature = "cef")]
+            accelerated: None,
         }
+    }
+
+    /// A frame that already lives on the GPU.
+    ///
+    /// `raw_pixels` stays empty: there is deliberately no CPU copy to fall
+    /// back to, so anything that needs one (`as_handle`) will come up blank
+    /// rather than quietly costing a readback.
+    #[cfg(feature = "cef")]
+    fn from_accelerated(
+        surface: Arc<crate::engines::accelerated::AcceleratedSurface>,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            pixel_format: PixelFormat::Bgra,
+            handle: std::sync::OnceLock::new(),
+            raw_pixels: Arc::new(Vec::new()),
+            accelerated: Some(surface),
+        }
+    }
+
+    /// The GPU surface holding this frame, if it is not a CPU buffer.
+    #[cfg(feature = "cef")]
+    pub(crate) fn accelerated(
+        &self,
+    ) -> Option<&Arc<crate::engines::accelerated::AcceleratedSurface>> {
+        self.accelerated.as_ref()
     }
 
     /// Get the image handle for direct rendering.
@@ -158,6 +197,8 @@ impl ImageInfo {
             pixel_format: PixelFormat::Rgba,
             handle: std::sync::OnceLock::new(),
             raw_pixels,
+            #[cfg(feature = "cef")]
+            accelerated: None,
         }
     }
 }

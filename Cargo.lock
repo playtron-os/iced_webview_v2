@@ -3687,6 +3687,7 @@ dependencies = [
  "cef",
  "cursor-icon",
  "dpi 0.1.2",
+ "env_logger",
  "euclid",
  "iced",
  "keyboard-types 0.7.0",

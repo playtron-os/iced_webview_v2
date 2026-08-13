@@ -9,6 +9,7 @@ use iced::mouse::{self, Interaction};
 use iced::{Point, Size};
 use rand::Rng;
 
+use super::accelerated::{AcceleratedSurface, DmabufFrame};
 use super::{ConsoleMessage, Engine, PageType, PixelFormat, ViewId};
 use crate::engines::EvalResult;
 use crate::ImageInfo;
@@ -19,12 +20,79 @@ use crate::ImageInfo;
 use cef::args::Args;
 use cef::*;
 
+/// Whether to take frames as GPU buffers instead of reading them back to the
+/// CPU (see `super::accelerated`).
+///
+/// On wherever it can work, because the alternative is markedly worse: the CPU
+/// path also forces Chromium's compositor into software, so the page is both
+/// rasterized and composited without the GPU and then copied across the bus
+/// twice per frame.
+///
+/// The decision is made once, before any browser exists, because it cannot be
+/// revisited: a browser created to deliver GPU frames stops emitting CPU ones
+/// entirely, so a wrong answer here shows an empty view rather than a slow one.
+/// Hence the two preconditions below are checked up front rather than
+/// discovered on the first frame.
+///
+/// `ICED_WEBVIEW_ACCELERATED=0` forces the CPU path; `=1` forces the GPU path
+/// even if the capability check says no, which is only useful for working out
+/// why the check disagrees with reality.
+fn accelerated_paint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("ICED_WEBVIEW_ACCELERATED") {
+            Ok(v) if matches!(v.trim(), "0" | "false" | "no") => return false,
+            Ok(v) if matches!(v.trim(), "1" | "true" | "yes") => return true,
+            _ => {}
+        }
+
+        // Only the Wayland ozone platform allocates the buffers this path
+        // needs — headless hands out a stub with no memory behind it, and x11
+        // hands out buffers whose layout it declines to describe. And ozone
+        // wayland needs a compositor to talk to.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            log::info!("iced_webview: not a Wayland session, using the CPU rendering path");
+            return false;
+        }
+
+        if !super::accelerated::can_import_dmabuf() {
+            log::info!(
+                "iced_webview: no GPU here can import browser frames, \
+                 using the CPU rendering path"
+            );
+            return false;
+        }
+
+        true
+    })
+}
+
 /// Shared mutable state populated by CEF handler callbacks and drained
 /// each `update()` tick.
 struct SharedState {
     /// New frame ready for consumption by `update()`. The `Arc` is shared
     /// with the shader pipeline so no copy is needed.
     frame_buffer: Option<(Arc<Vec<u8>>, u32, u32)>,
+    /// Frames delivered as GPU textures, when the accelerated path is on.
+    /// Populated by `on_accelerated_paint` instead of `frame_buffer`.
+    accelerated: Arc<AcceleratedSurface>,
+    /// Size of the last accelerated frame, so `update()` can report the view
+    /// dimensions without touching the texture.
+    accelerated_size: (u32, u32),
+    /// Frame count already published to the view, so `update()` can tell a new
+    /// GPU frame from an unchanged one without comparing pixels.
+    accelerated_seen: u64,
+    /// Pixel size CEF still owes us a frame at, and how long to keep asking.
+    ///
+    /// CEF holds a resize until a painted frame comes back at exactly the new
+    /// size, and on the GPU path the capturer's resolution deliberately lags
+    /// the view by a frame — so the first capture after a resize usually still
+    /// carries the old size, the hold never lifts, and every later resize is
+    /// swallowed. On a static page nothing else paints, so the view freezes
+    /// until unrelated damage (a scroll) happens to shake it loose. We break
+    /// that by asking for frames until one arrives at the size CEF expects.
+    expected_pixels: Option<(u32, u32)>,
+    expect_until: Option<std::time::Instant>,
     /// Persistent pixel buffer reused across on_paint calls. Dirty rects
     /// are blitted into it via `Arc::make_mut` (copy-on-write: only copies
     /// if the shader still holds a reference to the previous frame).
@@ -52,6 +120,51 @@ struct SharedState {
     /// Whether the focused DOM node accepts text — the cue a host needs to
     /// raise an on-screen keyboard.
     editable_focus: bool,
+}
+
+impl SharedState {
+    /// How long to keep asking CEF for a correctly-sized frame.
+    ///
+    /// Long enough to cover the capturer catching up (measured at 10-30ms),
+    /// short enough that a size which can never be satisfied stops rather than
+    /// invalidating forever.
+    const EXPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// Note that CEF owes us a frame at the pixel size implied by `size`.
+    ///
+    /// Mirrors `CefRenderWidgetHostViewOSR::SizeInPixels()`, which is what CEF
+    /// compares the delivered frame against when deciding to lift a resize hold.
+    fn expect_frame_at(&mut self, size: Size<u32>) {
+        let pixels = |v: u32| ((v as f32) * self.scale_factor).ceil() as u32;
+        self.expected_pixels = Some((pixels(size.width), pixels(size.height)));
+        self.expect_until = Some(std::time::Instant::now() + Self::EXPECT_TIMEOUT);
+    }
+
+    /// Whether to ask CEF for another frame this tick.
+    ///
+    /// Clears the expectation once met, so a settled view stops asking.
+    fn wants_repaint(&mut self) -> bool {
+        let Some(expected) = self.expected_pixels else {
+            // Nothing pending, but a view that has never painted still needs
+            // one frame to get started.
+            return self.accelerated.frame_count() == 0;
+        };
+        if self.accelerated_size == expected {
+            self.expected_pixels = None;
+            self.expect_until = None;
+            return false;
+        }
+        match self.expect_until {
+            Some(until) if std::time::Instant::now() < until => true,
+            _ => {
+                // Gave up. Leaving the expectation set would make every later
+                // tick re-check a size that is never going to arrive.
+                self.expected_pixels = None;
+                self.expect_until = None;
+                false
+            }
+        }
+    }
 }
 
 impl OsrRenderHandler {
@@ -238,17 +351,70 @@ wrap_app! {
         ) {
             let Some(cmd) = command_line else { return };
 
-            // OSR delivers pixels through `on_paint`, so CEF must never bring up
-            // a real windowing platform: besides conflicting with the host iced
-            // app's display connection, a real platform breaks HiDPI. Chromium
-            // then takes the device scale factor from the *platform screen*
-            // (1x under XWayland) and ignores the one `GetScreenInfo` reports
+            // Which ozone platform to run depends on how frames are delivered.
+            //
+            // Headless is the safe default: it never brings up a real windowing
+            // platform, so it cannot conflict with the host iced app's display
+            // connection, and it keeps HiDPI working. A real platform makes
+            // Chromium take the device scale factor from the *platform screen*
+            // (1x under XWayland) and ignore the one `GetScreenInfo` reports
             // below, so the page rasterizes at 1x and gets upscaled into the
             // widget — visibly blurry on every scaled display.
-            cmd.append_switch_with_value(
-                Some(&CefString::from("ozone-platform")),
-                Some(&CefString::from("headless")),
-            );
+            //
+            // But headless cannot hand over GPU frames at all: its
+            // `CreateNativePixmap` returns a stub with no buffer behind it
+            // (chromium `ui/ozone/platform/headless/headless_surface_factory.cc`),
+            // so `on_accelerated_paint` never fires and OSR is stuck reading
+            // pixels back through the CPU. Wayland allocates real GBM buffers,
+            // which is what the zero-copy path needs.
+            if accelerated_paint_enabled() {
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("wayland")),
+                );
+
+                // Wayland ozone is the only platform that advertises
+                // per-window scaling, and that is what silently throws away
+                // the scale factor `screen_info` reports below: Chromium's
+                // `RenderWidgetHostViewBase::UpdateScreenInfo` overwrites the
+                // client's value with the scale of the window the view lives
+                // in — and an off-screen view has no window, so the lookup
+                // yields nothing and falls back to 1.0. The page then
+                // rasterizes at 1x and the shader upscales it: visibly blurry
+                // on every scaled display.
+                //
+                // The property is only set when `wp_fractional_scale_manager_v1`
+                // is bound, which this feature gates, so turning it off puts
+                // us back on the code path headless and x11 already take.
+                // Verified not to affect dmabuf delivery.
+                //
+                // Merge rather than replace: CEF has already put its own
+                // entries here and clobbering them would re-enable features it
+                // deliberately turned off.
+                let mut disabled =
+                    CefString::from(&cmd.switch_value(Some(&CefString::from("disable-features"))))
+                        .to_string();
+                if !disabled.is_empty() {
+                    disabled.push(',');
+                }
+                disabled.push_str("WaylandFractionalScaleV1");
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("disable-features")),
+                    Some(&CefString::from(disabled.as_str())),
+                );
+                // ANGLE must go through EGL for the dmabuf export to work. The
+                // fallback path uses X11 pixmaps, which only Mesa implements —
+                // CEF makes the same choice for its own shared-texture sample.
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("use-angle")),
+                    Some(&CefString::from("gl-egl")),
+                );
+            } else {
+                cmd.append_switch_with_value(
+                    Some(&CefString::from("ozone-platform")),
+                    Some(&CefString::from("headless")),
+                );
+            }
 
             // Headless ozone still reaches the GPU through EGL surfaceless, so
             // WebGL stays hardware-accelerated. `ICED_WEBVIEW_DISABLE_GPU=1`
@@ -268,6 +434,17 @@ wrap_app! {
                 Some(&CefString::from("basic")),
             );
 
+            // Chromium's own view of what it was asked to do, which is the
+            // only place switches added after this handler show up.
+            log::debug!(
+                "iced_webview: chromium cmdline ({}): {}",
+                process_type
+                    .map(|t| t.to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| "browser".to_string()),
+                CefString::from(&cmd.command_line_string())
+            );
+
             // The rest are browser-process only.
             let is_browser_process = process_type.is_none_or(|t| t.to_string().is_empty());
             if !is_browser_process {
@@ -276,7 +453,18 @@ wrap_app! {
 
             // Keeps the OSR texture from glitching on resize — this is
             // what actually fixes the context conflict.
-            cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+            //
+            // It also puts Chromium's compositor entirely in software: with it
+            // set, `chrome://gpu` reports "Compositing: Software only" even
+            // though Canvas and rasterization stay hardware accelerated. That
+            // is survivable for the CPU path, which reads pixels back anyway,
+            // but it is fatal for GPU frame delivery — CEF only builds the
+            // capturer behind `on_accelerated_paint` when GPU compositing is
+            // live (`render_widget_host_view_osr.cc`, `Show()`), so leaving
+            // this on makes the accelerated path silently do nothing.
+            if !accelerated_paint_enabled() {
+                cmd.append_switch(Some(&CefString::from("disable-gpu-compositing")));
+            }
             cmd.append_switch(Some(&CefString::from("disable-gpu-shader-disk-cache")));
             cmd.append_switch(Some(&CefString::from("enable-accelerated-2d-canvas")));
             cmd.append_switch_with_value(
@@ -356,6 +544,16 @@ wrap_render_handler! {
                 return;
             }
 
+            if accelerated_paint_enabled() {
+                static WARNED: AtomicBool = AtomicBool::new(false);
+                if !WARNED.swap(true, Ordering::Relaxed) {
+                    log::warn!(
+                        "iced_webview: GPU frame delivery was enabled, but the browser \
+                         is still painting through the CPU"
+                    );
+                }
+            }
+
             let w = width as u32;
             let h = height as u32;
             let stride = (w as usize) * 4;
@@ -392,6 +590,86 @@ wrap_render_handler! {
             }
 
             shared.frame_buffer = Some((Arc::clone(&shared.persistent_buffer), w, h));
+        }
+
+        fn on_accelerated_paint(
+            &self,
+            _browser: Option<&mut Browser>,
+            type_: PaintElementType,
+            _dirty_rects: Option<&[Rect]>,
+            info: Option<&AcceleratedPaintInfo>,
+        ) {
+            let Some(info) = info else { return };
+
+            static ANNOUNCED: AtomicBool = AtomicBool::new(false);
+            if !ANNOUNCED.swap(true, Ordering::Relaxed) {
+                log::info!(
+                    "iced_webview: browser frames are being delivered on the GPU \
+                     ({} plane(s), modifier {:#x})",
+                    info.plane_count,
+                    info.modifier
+                );
+            }
+
+            // A popup pass is a separate little surface for a `<select>` list
+            // or autofill menu. Compositing it would mean a second import and
+            // a partial blit; until that is worth doing, let the page keep
+            // showing underneath rather than replacing it with the dropdown.
+            if type_ == PaintElementType::POPUP {
+                return;
+            }
+
+            if info.plane_count < 1 {
+                return;
+            }
+            let plane = &info.planes[0];
+
+            // Three rects, and the difference matters:
+            //   coded_size   — the whole buffer
+            //   visible_rect — the part holding image data
+            //   content_rect — the part holding the *page*, the rest of the
+            //                  frame having been letterboxed
+            // While the capture resolution catches up with a resize the
+            // content is letterboxed inside the frame, so taking `visible_rect`
+            // from the origin copies the bars: black gaps along the top and
+            // left. Keep the content and nothing else.
+            let coded = &info.extra.coded_size;
+            let content = &info.extra.content_rect;
+            let width = content.width.max(0) as u32;
+            let height = content.height.max(0) as u32;
+
+            let frame = DmabufFrame {
+                fd: plane.fd,
+                stride: plane.stride,
+                offset: plane.offset as u32,
+                src_x: content.x.max(0) as u32,
+                src_y: content.y.max(0) as u32,
+                total_size: plane.size,
+                modifier: info.modifier,
+                buffer_width: coded.width.max(0) as u32,
+                buffer_height: coded.height.max(0) as u32,
+                width,
+                height,
+                // CEF reports the browser's own format; the renderer decides
+                // what our copy is sampled as.
+                format: if info.format == ColorType::RGBA_8888 {
+                    iced::wgpu::TextureFormat::Rgba8Unorm
+                } else {
+                    iced::wgpu::TextureFormat::Bgra8Unorm
+                },
+            };
+
+            // Take the surface out from under the borrow: importing blocks on
+            // the GPU, and holding the `RefCell` across that would deadlock
+            // any handler that runs in the meantime.
+            let surface = {
+                let shared = self.shared.borrow();
+                Arc::clone(&shared.accelerated)
+            };
+
+            if surface.accept_frame(&frame) {
+                self.shared.borrow_mut().accelerated_size = (width, height);
+            }
         }
     }
 }
@@ -1074,6 +1352,11 @@ impl Cef {
 
         let shared = Rc::new(RefCell::new(SharedState {
             frame_buffer: None,
+            accelerated: Arc::new(AcceleratedSurface::new()),
+            accelerated_size: (0, 0),
+            accelerated_seen: 0,
+            expected_pixels: None,
+            expect_until: None,
             persistent_buffer: Arc::new(Vec::new()),
             persistent_size: (0, 0),
             url: None,
@@ -1109,7 +1392,12 @@ impl Cef {
             Rc::clone(&shared),
         );
 
-        let window_info = WindowInfo::default().set_as_windowless(0);
+        // `shared_texture_enabled` is what switches CEF from `on_paint` to
+        // `on_accelerated_paint`; the two are mutually exclusive.
+        let window_info = WindowInfo {
+            shared_texture_enabled: i32::from(accelerated_paint_enabled()),
+            ..WindowInfo::default().set_as_windowless(0)
+        };
         let browser_settings = BrowserSettings {
             windowless_frame_rate: 60,
             background_color: self.background_color.unwrap_or(0xFFFFFFFF),
@@ -1132,6 +1420,11 @@ impl Cef {
         // i.e. a portal you are supposed to type an email into looks dead.
         if let Some(host) = browser.host() {
             host.set_focus(1);
+            // Off-screen there is no window to become visible, so the view has
+            // to be told. It matters beyond bookkeeping: CEF only builds the
+            // capturer that delivers GPU frames when the view is shown
+            // (`render_widget_host_view_osr.cc`, `Show()`).
+            host.was_hidden(0);
         }
 
         Some(CefView {
@@ -1191,14 +1484,49 @@ impl Engine for Cef {
         for view in &mut self.views {
             let mut shared = view.shared.borrow_mut();
 
+            // The surface has to reach the renderer before the first frame,
+            // not after it: the renderer is the only thing that knows which
+            // GPU device exists, and until it has told the surface, every
+            // frame the browser paints is dropped. Publishing an empty one
+            // (which draws nothing) is what breaks that circle.
+            let delivered = shared.accelerated.frame_count();
+            let mut needs_repaint = false;
+            if accelerated_paint_enabled() {
+                if view.last_frame.accelerated().is_none() {
+                    // The surface has to reach the renderer before the first
+                    // frame: the renderer is the only thing that knows which
+                    // GPU device exists, and until it has told the surface,
+                    // every frame the browser paints is dropped. Publishing an
+                    // empty one (which draws nothing) breaks that circle.
+                    view.last_frame =
+                        ImageInfo::from_accelerated(Arc::clone(&shared.accelerated), 0, 0);
+                } else if shared.accelerated.has_gpu() {
+                    // Ask for a frame, but not from here: `invalidate` can
+                    // paint synchronously, and the handler it calls wants this
+                    // same `RefCell`.
+                    needs_repaint = shared.wants_repaint();
+                }
+            }
+
+            // On the accelerated path the frame is already a texture, so there
+            // is nothing to hand over but the surface itself — republished
+            // only when the browser has actually painted since last time.
+            if delivered > shared.accelerated_seen {
+                shared.accelerated_seen = delivered;
+                let (w, h) = shared.accelerated_size;
+                view.last_frame =
+                    ImageInfo::from_accelerated(Arc::clone(&shared.accelerated), w, h);
+                view.needs_render = false;
+            }
+
             if let Some((pixels, w, h)) = shared.frame_buffer.take() {
                 let t0 = std::time::Instant::now();
                 view.last_frame = ImageInfo::from_arc(pixels, PixelFormat::Bgra, w, h);
                 view.needs_render = false;
                 let elapsed = t0.elapsed();
                 if elapsed.as_millis() > 2 {
-                    eprintln!(
-                        "[cef] slow frame {}×{} took {}ms",
+                    log::debug!(
+                        "iced_webview: slow CPU frame {}×{} took {}ms",
                         w,
                         h,
                         elapsed.as_millis()
@@ -1212,6 +1540,14 @@ impl Engine for Cef {
                 view.title = title;
             }
             view.cursor = cursor_type_to_interaction(shared.cursor_type);
+
+            // Every handler CEF may call from here wants this borrow.
+            drop(shared);
+            if needs_repaint {
+                if let Some(host) = view.browser.host() {
+                    host.invalidate(PaintElementType::VIEW);
+                }
+            }
         }
     }
 
@@ -1318,7 +1654,11 @@ impl Engine for Cef {
         let new_size = Size::new(w, h);
         for view in &mut self.views {
             view.size = new_size;
-            view.shared.borrow_mut().size = new_size;
+            {
+                let mut shared = view.shared.borrow_mut();
+                shared.size = new_size;
+                shared.expect_frame_at(new_size);
+            }
             if let Some(host) = view.browser.host() {
                 host.was_resized();
             }
@@ -1332,7 +1672,14 @@ impl Engine for Cef {
         }
         self.scale_factor = scale;
         for view in &mut self.views {
-            view.shared.borrow_mut().scale_factor = scale;
+            {
+                // Changing the scale changes the pixel size CEF paints at, so
+                // it takes the same resize hold as a bounds change.
+                let mut shared = view.shared.borrow_mut();
+                shared.scale_factor = scale;
+                let size = shared.size;
+                shared.expect_frame_at(size);
+            }
             if let Some(host) = view.browser.host() {
                 host.notify_screen_info_changed();
                 host.was_resized();

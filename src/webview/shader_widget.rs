@@ -56,6 +56,10 @@ pub struct WebViewPrimitive {
     pub(crate) pixel_format: PixelFormat,
     /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
     pub(crate) detected_scale: Arc<AtomicU32>,
+    /// Set when the frame is already a GPU texture, in which case `pixels` is
+    /// empty and there is nothing to upload.
+    #[cfg(feature = "cef")]
+    pub(crate) accelerated: Option<Arc<crate::engines::accelerated::AcceleratedSurface>>,
 }
 
 impl std::fmt::Debug for WebViewPrimitive {
@@ -71,6 +75,10 @@ pub struct WebViewPipeline {
     texture: wgpu::Texture,
     texture_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// Holds the widget/texture size ratio the fragment shader anchors with.
+    layout_buffer: wgpu::Buffer,
+    /// Last ratio written, so a settled view stops touching the queue.
+    last_uv_scale: [f32; 2],
     bind_group_layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     render_pipeline: wgpu::RenderPipeline,
@@ -85,6 +93,11 @@ pub struct WebViewPipeline {
     /// When the Arc points to the same allocation, the frame is unchanged
     /// and `write_texture()` can be skipped entirely.
     last_pixels_ptr: usize,
+    /// Generation of the GPU surface the bind group currently points at.
+    /// Frames arriving into the same texture do not change it — only a resize
+    /// does, which is exactly when the bind group has to be rebuilt.
+    #[cfg(feature = "cef")]
+    accel_generation: Option<u64>,
 }
 
 impl WebViewPipeline {
@@ -97,25 +110,62 @@ impl WebViewPipeline {
     ) {
         let (texture, texture_view) = create_texture(device, width.max(1), height.max(1), format);
 
-        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("webview_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        self.bind_group = make_bind_group(
+            device,
+            &self.bind_group_layout,
+            &texture_view,
+            &self.sampler,
+            &self.layout_buffer,
+        );
 
         self.texture = texture;
         self.texture_view = texture_view;
         self.texture_size = (width, height);
         self.texture_format = format;
+    }
+
+    /// Tell the shader how the texture maps onto the widget.
+    ///
+    /// The ratio is 1:1 whenever the page has caught up, which is the steady
+    /// state; it only departs from that for the frame or two after a resize,
+    /// where anchoring beats stretching.
+    fn set_anchor(&mut self, queue: &wgpu::Queue, bounds: &Rectangle, scale: f32) {
+        let (tex_w, tex_h) = self.texture_size;
+        if tex_w == 0 || tex_h == 0 {
+            return;
+        }
+        let bounds_w = (bounds.width * scale).round().max(1.0);
+        let bounds_h = (bounds.height * scale).round().max(1.0);
+        let uv_scale = [bounds_w / tex_w as f32, bounds_h / tex_h as f32];
+
+        // Writing every frame would queue a buffer copy per frame for a value
+        // that almost never changes.
+        if uv_scale == self.last_uv_scale {
+            return;
+        }
+        self.last_uv_scale = uv_scale;
+        let mut data = [0u8; 16];
+        data[0..4].copy_from_slice(&uv_scale[0].to_ne_bytes());
+        data[4..8].copy_from_slice(&uv_scale[1].to_ne_bytes());
+        queue.write_buffer(&self.layout_buffer, 0, &data);
+    }
+
+    /// Point the bind group at a texture we did not allocate.
+    ///
+    /// Used for GPU-delivered frames, where the texture belongs to the
+    /// browser surface rather than to this pipeline.
+    #[cfg(feature = "cef")]
+    fn bind_external(&mut self, device: &wgpu::Device, texture: &wgpu::Texture) {
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.bind_group = make_bind_group(
+            device,
+            &self.bind_group_layout,
+            &view,
+            &self.sampler,
+            &self.layout_buffer,
+        );
+        self.texture_size = (texture.width(), texture.height());
+        self.texture_format = texture.format();
     }
 }
 
@@ -139,6 +189,33 @@ fn to_wgpu_format(pf: &PixelFormat, target_is_srgb: bool) -> wgpu::TextureFormat
         (PixelFormat::Rgba, true) => wgpu::TextureFormat::Rgba8UnormSrgb,
         (PixelFormat::Rgba, false) => wgpu::TextureFormat::Rgba8Unorm,
     }
+}
+
+fn make_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+    layout_buffer: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("webview_bind_group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: layout_buffer.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 fn create_texture(
@@ -175,13 +252,52 @@ impl shader::Primitive for WebViewPrimitive {
         pipeline: &mut Self::Pipeline,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _bounds: &Rectangle,
+        bounds: &Rectangle,
         viewport: &shader::Viewport,
     ) {
         // Store the display scale factor so the WebView can pick it up
         // and inform the engine (e.g. CEF's device_scale_factor).
         self.detected_scale
             .store(viewport.scale_factor().to_bits(), Ordering::Relaxed);
+
+        // A GPU-delivered frame is already in a texture: there is nothing to
+        // upload, only a bind group to keep pointed at the right one. This is
+        // also where the surface first learns which device to import into —
+        // it has no other way to find out, and it drops frames until it does.
+        #[cfg(feature = "cef")]
+        if let Some(surface) = &self.accelerated {
+            surface.attach_gpu(
+                device,
+                queue,
+                to_wgpu_format(&self.pixel_format, pipeline.target_is_srgb),
+            );
+
+            if let Some((texture, generation)) = surface.current() {
+                if pipeline.accel_generation != Some(generation) {
+                    pipeline.bind_external(device, &texture);
+                    pipeline.accel_generation = Some(generation);
+                    // Any CPU frame that follows must re-upload: the bind group
+                    // no longer points at this pipeline's own texture.
+                    pipeline.last_pixels_ptr = 0;
+                }
+                pipeline.set_anchor(queue, bounds, viewport.scale_factor());
+            }
+            return;
+        }
+
+        // Coming back from a GPU-delivered frame, the bind group is still
+        // pointed at the surface's texture, so it has to be aimed at this
+        // pipeline's own one again before anything is uploaded into it.
+        #[cfg(feature = "cef")]
+        if pipeline.accel_generation.take().is_some() {
+            pipeline.recreate_texture(
+                device,
+                self.width.max(1),
+                self.height.max(1),
+                to_wgpu_format(&self.pixel_format, pipeline.target_is_srgb),
+            );
+            pipeline.last_pixels_ptr = 0;
+        }
 
         let needed_format = to_wgpu_format(&self.pixel_format, pipeline.target_is_srgb);
         if (self.width, self.height) != pipeline.texture_size
@@ -191,6 +307,11 @@ impl shader::Primitive for WebViewPrimitive {
             // Force re-upload after texture recreation
             pipeline.last_pixels_ptr = 0;
         }
+
+        // Before the early-out below: the uniform starts zeroed, and a zero
+        // ratio collapses every sample onto the top-left texel, so this has to
+        // run on the CPU path too — not only when a frame is uploaded.
+        pipeline.set_anchor(queue, bounds, viewport.scale_factor());
 
         // Skip upload when the pixel buffer hasn't changed (same Arc allocation).
         let current_ptr = Arc::as_ptr(&self.pixels) as usize;
@@ -274,23 +395,34 @@ impl shader::Pipeline for WebViewPipeline {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("webview_bind_group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
+        // Starts at 1:1 — the widget and the page agree until a resize.
+        let layout_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("webview_layout"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
+
+        let bind_group = make_bind_group(
+            device,
+            &bind_group_layout,
+            &texture_view,
+            &sampler,
+            &layout_buffer,
+        );
 
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("webview_shader"),
@@ -339,10 +471,14 @@ impl shader::Pipeline for WebViewPipeline {
             bind_group_layout,
             bind_group,
             render_pipeline,
+            layout_buffer,
+            last_uv_scale: [0.0, 0.0],
             texture_size: (1, 1),
             texture_format: initial_tex_format,
             target_is_srgb,
             last_pixels_ptr: 0,
+            #[cfg(feature = "cef")]
+            accel_generation: None,
         }
     }
 }
@@ -517,6 +653,8 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
             height: self.image_info.image_height(),
             pixel_format: self.image_info.pixel_format().clone(),
             detected_scale: self.detected_scale.clone(),
+            #[cfg(feature = "cef")]
+            accelerated: self.image_info.accelerated().cloned(),
         }
     }
 
@@ -556,9 +694,23 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
 @group(0) @binding(0) var t_texture: texture_2d<f32>;
 @group(0) @binding(1) var t_sampler: sampler;
 
+struct Anchor {
+    // widget size / texture size, in physical pixels. 1.0 once the page has
+    // caught up with the widget, which is the steady state.
+    uv_scale: vec2<f32>,
+    _pad: vec2<f32>,
+};
+@group(0) @binding(2) var<uniform> anchor: Anchor;
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var color = textureSample(t_texture, t_sampler, in.uv);
+    // Anchor the page at the top-left at 1:1 rather than stretching it over
+    // the widget. While a resize settles the page is briefly a different size
+    // than the widget, and scaling it to fit makes the whole view rubber-band
+    // on every drag; anchoring keeps the content still and only the newly
+    // exposed strip is wrong for a frame. The sampler clamps to edge, so that
+    // strip repeats the border pixels instead of showing a hole.
+    var color = textureSample(t_texture, t_sampler, in.uv * anchor.uv_scale);
     color.a = 1.0;
     return color;
 }

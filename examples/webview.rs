@@ -24,6 +24,11 @@ fn main() -> iced::Result {
         return Ok(());
     }
 
+    // The crate reports which rendering path it took, and why, through `log`.
+    // Without a logger that is all invisible. `RUST_LOG=iced_webview=debug`
+    // adds per-frame timings.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
     iced::application(App::new, App::update, App::view)
         .title("Web view")
         .subscription(App::subscription)

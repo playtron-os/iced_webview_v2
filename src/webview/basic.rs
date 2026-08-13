@@ -179,6 +179,11 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
 
     /// Set the display scale factor for HiDPI rendering.
     /// The engine will render at `logical_size * scale_factor` pixels.
+    ///
+    /// Worth calling with the window's own scale factor *before* creating a
+    /// view. The scale is otherwise learned from the first rendered frame, so
+    /// a view created before then is built at 1x and re-rasterizes a frame or
+    /// two later — briefly visible as the page snapping into focus.
     pub fn set_scale_factor(&mut self, scale: f32) {
         self.scale_factor = scale;
         self.engine.set_scale_factor(scale);

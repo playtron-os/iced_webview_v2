@@ -96,3 +96,8 @@ name = "email"
 [[example]]
 name = "embedded_webview"
 
+[[example]]
+name = "gpuinfo"
+
+[dev-dependencies]
+env_logger = "0.11"

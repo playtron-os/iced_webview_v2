@@ -657,6 +657,8 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
             height: self.image_info.image_height(),
             pixel_format: self.image_info.pixel_format().clone(),
             detected_scale: self.detected_scale.clone(),
+            #[cfg(feature = "cef")]
+            accelerated: self.image_info.accelerated().cloned(),
         }
     }
 
