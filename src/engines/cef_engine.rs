@@ -1705,6 +1705,25 @@ impl Engine for Cef {
         }
     }
 
+    fn resize_view(&mut self, id: ViewId, size: Size<u32>) {
+        let w = size.width.max(1);
+        let h = size.height.max(1);
+        let new_size = Size::new(w, h);
+        let Some(view) = self.views.iter_mut().find(|v| v.id == id) else {
+            return;
+        };
+        view.size = new_size;
+        {
+            let mut shared = view.shared.borrow_mut();
+            shared.size = new_size;
+            shared.expect_frame_at(new_size);
+        }
+        if let Some(host) = view.browser.host() {
+            host.was_resized();
+        }
+        view.needs_render = true;
+    }
+
     fn resize(&mut self, size: Size<u32>) {
         let w = size.width.max(1);
         let h = size.height.max(1);

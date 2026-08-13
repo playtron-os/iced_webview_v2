@@ -117,6 +117,16 @@ pub trait Engine {
     fn unfocus(&self);
     /// Resizes webview
     fn resize(&mut self, size: Size<u32>);
+
+    /// Resize a single view.
+    ///
+    /// Views can be shown at different sizes at the same time — one per
+    /// display, say — in which case resizing all of them together makes each
+    /// surface fight the others for the size. Engines that cannot do this
+    /// fall back to resizing everything.
+    fn resize_view(&mut self, _id: ViewId, size: Size<u32>) {
+        self.resize(size);
+    }
     /// Set the display scale factor for HiDPI rendering. Default is no-op.
     fn set_scale_factor(&mut self, _scale: f32) {}
 

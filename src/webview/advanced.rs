@@ -39,6 +39,9 @@ pub enum Action {
     /// Call this periodically to update a view(s)
     UpdateAll,
     Resize(Size<u32>),
+    /// Resize one view, leaving the others alone. Sent by the widget, which
+    /// knows which view it is drawing.
+    ResizeView(ViewId, Size<u32>),
     /// Copy the current text selection to clipboard
     CopySelection(ViewId),
     /// Internal: carries the result of a URL fetch for engines without native URL support.
@@ -68,6 +71,7 @@ where
     on_title_change: Option<Box<dyn Fn(ViewId, String) -> Message>>,
     titles: Vec<(ViewId, String)>,
     on_copy: Option<Box<dyn Fn(String) -> Message>>,
+    on_console_message: Option<Box<dyn Fn(engines::ConsoleMessage) -> Message>>,
     action_mapper: Option<Arc<dyn Fn(Action) -> Message + Send + Sync>>,
     inflight_images: usize,
     nav_epochs: HashMap<ViewId, u64>,
@@ -90,6 +94,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             on_title_change: None,
             titles: Vec::new(),
             on_copy: None,
+            on_console_message: None,
             action_mapper: None,
             inflight_images: 0,
             nav_epochs: HashMap::new(),
@@ -170,6 +175,20 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Subscribe to console messages (`console.log`/`warn`/`error`/…) emitted
+    /// by pages in **any** view.
+    ///
+    /// Unlike the basic widget this is not limited to a current view — with
+    /// several views on screen at once there isn't one, and a page that only
+    /// exists on a second display would otherwise be unheard.
+    pub fn on_console_message(
+        mut self,
+        on_console_message: impl Fn(engines::ConsoleMessage) -> Message + 'static,
+    ) -> Self {
+        self.on_console_message = Some(Box::new(on_console_message));
+        self
+    }
+
     /// Provide a mapper from Action to Message so the webview can spawn async
     /// tasks (e.g. URL fetches) that route back through the update loop.
     /// Required for URL navigation on engines that don't handle URLs natively.
@@ -198,6 +217,17 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 if *title != engine_title {
                     *title = engine_title.clone();
                     tasks.push(Task::done(on_title_change(*id, engine_title)));
+                }
+            }
+        }
+
+        if let Some(on_console_message) = &self.on_console_message {
+            // Every view, not just one: the ids are already tracked here for
+            // url/title changes, so this reuses the same set.
+            let ids: Vec<ViewId> = self.urls.iter().map(|(id, _)| *id).collect();
+            for id in ids {
+                for message in self.engine.take_console_messages(id) {
+                    tasks.push(Task::done(on_console_message(message)));
                 }
             }
         }
@@ -422,6 +452,11 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
 
                 return Task::batch(tasks);
             }
+            Action::ResizeView(id, size) => {
+                // Deliberately does not touch `view_size`: with several views
+                // on screen at once there is no single size to record.
+                self.engine.resize_view(id, size);
+            }
             Action::Resize(size) => {
                 if self.view_size != size {
                     self.view_size = size;
@@ -579,7 +614,10 @@ impl<'a> shader::Program<Action> for AdvancedShaderProgram<'a> {
         let size = Size::new(bounds.width as u32, bounds.height as u32);
         if state.bounds != size {
             state.bounds = size;
-            return Some(shader::Action::publish(Action::Resize(size)));
+            return Some(shader::Action::publish(Action::ResizeView(
+                self.view_id,
+                size,
+            )));
         }
 
         match event {
@@ -795,7 +833,7 @@ where
     ) {
         let size = Size::new(layout.bounds().width as u32, layout.bounds().height as u32);
         if self.bounds != size {
-            shell.publish(Action::Resize(size));
+            shell.publish(Action::ResizeView(self.id, size));
         }
 
         match event {
