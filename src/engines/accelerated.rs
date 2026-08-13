@@ -30,6 +30,13 @@ use iced::wgpu;
 /// explicit-modifier path cannot do — see the check in [`AcceleratedSurface::accept_frame`].
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// Hands out texture generations that are unique across every surface in the
+/// process. See [`AcceleratedSurface::generation`].
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Whether any GPU on this machine can import browser frames.
 ///
 /// Asked before the first browser is created, because that is when the choice
@@ -127,9 +134,15 @@ struct Target {
 pub struct AcceleratedSurface {
     gpu: Mutex<Option<Gpu>>,
     target: Mutex<Option<Target>>,
-    /// Bumped whenever the texture *identity* changes, so a caller caching a
-    /// bind group knows when to rebuild it. Frame contents changing does not
-    /// bump it — we copy into the same texture.
+    /// Changes whenever the texture *identity* does, so a caller caching a bind
+    /// group knows when to rebuild it. Frame contents changing does not change
+    /// it — we copy into the same texture.
+    ///
+    /// Drawn from a process-wide counter rather than counting up per surface.
+    /// The renderer keys its cached bind group on this value, and its pipeline
+    /// storage is shared by every webview in the process, so two surfaces that
+    /// both numbered their first texture "1" would look identical to it — the
+    /// second would skip rebinding and draw the first one's page.
     generation: AtomicU64,
     /// Frames accepted so far. The host uses this to tell whether a redraw is
     /// worth scheduling.
@@ -182,7 +195,7 @@ impl AcceleratedSurface {
             Some(existing) if existing.target_format != target_format => {
                 existing.target_format = target_format;
                 *self.target.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                self.generation.fetch_add(1, Ordering::Relaxed);
+                self.generation.store(next_generation(), Ordering::Relaxed);
             }
             Some(_) => {}
         }
@@ -283,7 +296,7 @@ impl AcceleratedSurface {
                 format: gpu.target_format,
             });
             // Identity changed — anything caching a view of it must rebuild.
-            self.generation.fetch_add(1, Ordering::Relaxed);
+            self.generation.store(next_generation(), Ordering::Relaxed);
         }
         let Some(dst) = target.as_ref() else {
             return false;
