@@ -129,25 +129,33 @@ impl WebViewPipeline {
     /// The ratio is 1:1 whenever the page has caught up, which is the steady
     /// state; it only departs from that for the frame or two after a resize,
     /// where anchoring beats stretching.
-    fn set_anchor(&mut self, queue: &wgpu::Queue, bounds: &Rectangle, scale: f32) {
+    /// Returns whether the texture covers the widget, i.e. the page is being
+    /// shown at the size it was rendered for.
+    fn set_anchor(&mut self, queue: &wgpu::Queue, bounds: &Rectangle, scale: f32) -> bool {
         let (tex_w, tex_h) = self.texture_size;
         if tex_w == 0 || tex_h == 0 {
-            return;
+            return false;
         }
         let bounds_w = (bounds.width * scale).round().max(1.0);
         let bounds_h = (bounds.height * scale).round().max(1.0);
         let uv_scale = [bounds_w / tex_w as f32, bounds_h / tex_h as f32];
 
+        // Rounding between logical and physical pixels can leave the two a
+        // pixel apart on a fractional scale, which is not a mismatch worth
+        // reacting to.
+        let fits = uv_scale.iter().all(|s| (s - 1.0).abs() < 0.01);
+
         // Writing every frame would queue a buffer copy per frame for a value
         // that almost never changes.
-        if uv_scale == self.last_uv_scale {
-            return;
+        if uv_scale != self.last_uv_scale {
+            self.last_uv_scale = uv_scale;
+            let mut data = [0u8; 16];
+            data[0..4].copy_from_slice(&uv_scale[0].to_ne_bytes());
+            data[4..8].copy_from_slice(&uv_scale[1].to_ne_bytes());
+            queue.write_buffer(&self.layout_buffer, 0, &data);
         }
-        self.last_uv_scale = uv_scale;
-        let mut data = [0u8; 16];
-        data[0..4].copy_from_slice(&uv_scale[0].to_ne_bytes());
-        data[4..8].copy_from_slice(&uv_scale[1].to_ne_bytes());
-        queue.write_buffer(&self.layout_buffer, 0, &data);
+
+        fits
     }
 
     /// Point the bind group at a texture we did not allocate.
@@ -280,7 +288,10 @@ impl shader::Primitive for WebViewPrimitive {
                     // no longer points at this pipeline's own texture.
                     pipeline.last_pixels_ptr = 0;
                 }
-                pipeline.set_anchor(queue, bounds, viewport.scale_factor());
+                let fits = pipeline.set_anchor(queue, bounds, viewport.scale_factor());
+                if fits || surface.settle_deadline_passed() {
+                    surface.mark_settled();
+                }
             }
             return;
         }
@@ -346,6 +357,19 @@ impl shader::Primitive for WebViewPrimitive {
 
     fn draw(&self, pipeline: &Self::Pipeline, render_pass: &mut wgpu::RenderPass<'_>) -> bool {
         if self.width == 0 || self.height == 0 {
+            return true;
+        }
+
+        // Nothing to show until the page has been rendered at the size it is
+        // being displayed at — otherwise the opening frames appear small in the
+        // corner and then jump to fill. `true` means "handled"; drawing nothing
+        // leaves whatever is behind the widget.
+        #[cfg(feature = "cef")]
+        if self
+            .accelerated
+            .as_ref()
+            .is_some_and(|surface| !surface.is_settled())
+        {
             return true;
         }
         render_pass.set_pipeline(&pipeline.render_pipeline);

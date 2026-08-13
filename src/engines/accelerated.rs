@@ -153,6 +153,19 @@ pub struct AcceleratedSurface {
     /// can be logged — that is the signal that says whether the view settled
     /// at the size it was asked for.
     last_reported: AtomicU64,
+    /// Whether a frame has ever arrived at the size the widget actually is.
+    ///
+    /// A browser view is created before anything knows how big it will be, and
+    /// learns its scale only from the first rendered frame, so the first frames
+    /// are the wrong size. Drawing them shows the page small in a corner and
+    /// then jumping to fill — better to show nothing until it fits. Latched, so
+    /// this only suppresses the opening frames: once a view has been the right
+    /// size, later mismatches are resizes, where holding the last good frame
+    /// beats blanking.
+    settled: std::sync::atomic::AtomicBool,
+    /// When the first frame arrived, so waiting for a correctly-sized one can
+    /// be given up on. See [`Self::settle_deadline_passed`].
+    first_frame_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl std::fmt::Debug for AcceleratedSurface {
@@ -212,6 +225,41 @@ impl AcceleratedSurface {
     /// Number of frames accepted so far.
     pub fn frame_count(&self) -> u64 {
         self.frames.load(Ordering::Relaxed)
+    }
+
+    /// Whether the page has ever been rendered at the size it is displayed at.
+    ///
+    /// False only for the first frames of a view's life; see [`Self::settled`].
+    pub fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Relaxed)
+    }
+
+    /// Whether to give up waiting for a correctly-sized frame and show what we
+    /// have anyway.
+    ///
+    /// Suppressing the opening frames is only worth it because they are
+    /// replaced within a few milliseconds. If a view somehow never reaches the
+    /// size it is displayed at, a page drawn slightly wrong beats a permanently
+    /// blank one.
+    pub fn settle_deadline_passed(&self) -> bool {
+        const GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+        let first = self
+            .first_frame_at
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        first.is_some_and(|t| t.elapsed() > GRACE)
+    }
+
+    /// Record that the current frame matches the widget it is drawn into.
+    pub fn mark_settled(&self) {
+        if !self.settled.swap(true, Ordering::Relaxed) {
+            // Worth one line: until this happens the view deliberately draws
+            // nothing, so its absence is the explanation for a blank webview.
+            log::debug!(
+                "iced_webview: view settled at its display size after {} frame(s)",
+                self.frame_count()
+            );
+        }
     }
 
     /// The texture to sample, with the generation it belongs to.
@@ -343,6 +391,12 @@ impl AcceleratedSurface {
         }
 
         let n = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == 1 {
+            *self
+                .first_frame_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+        }
         self.import_nanos
             .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
