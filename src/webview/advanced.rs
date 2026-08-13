@@ -75,8 +75,14 @@ where
     action_mapper: Option<Arc<dyn Fn(Action) -> Message + Send + Sync>>,
     inflight_images: usize,
     nav_epochs: HashMap<ViewId, u64>,
-    /// Shared atomic for auto-detecting display scale factor from the GPU viewport.
-    detected_scale: Arc<AtomicU32>,
+    /// One scale per view, written by that view's renderer.
+    ///
+    /// Not one shared value: views can be on displays with different scale
+    /// factors, and a single slot means whichever rendered last wins and every
+    /// view is re-rasterized at the other display's scale.
+    detected_scales: HashMap<ViewId, Arc<AtomicU32>>,
+    /// Last scale pushed to each view, so unchanged ones are left alone.
+    applied_scales: HashMap<ViewId, f32>,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
@@ -98,7 +104,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             action_mapper: None,
             inflight_images: 0,
             nav_epochs: HashMap::new(),
-            detected_scale: Arc::new(AtomicU32::new(0)),
+            detected_scales: HashMap::new(),
+            applied_scales: HashMap::new(),
         }
     }
 }
@@ -121,21 +128,28 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.set_background_color(color);
     }
 
-    /// Reads the scale factor detected by the shader viewport and applies it
-    /// to the engine if it differs from the current value.
+    /// Apply each view's own detected scale, so views on displays with
+    /// different scale factors each rasterize for the one they are on.
     fn apply_detected_scale(&mut self) {
-        let bits = self.detected_scale.load(Ordering::Relaxed);
-        if bits == 0 {
-            return;
-        }
-        let detected = f32::from_bits(bits);
-        if detected > 0.0 && (detected - self.scale_factor).abs() > 0.01 {
-            log::info!(
-                "iced_webview: auto-detected display scale {:.2} (was {:.2})",
-                detected,
-                self.scale_factor
-            );
-            self.set_scale_factor(detected);
+        let detected: Vec<(ViewId, f32)> = self
+            .detected_scales
+            .iter()
+            .filter_map(|(id, slot)| {
+                let bits = slot.load(Ordering::Relaxed);
+                (bits != 0).then(|| (*id, f32::from_bits(bits)))
+            })
+            .filter(|(_, scale)| *scale > 0.0)
+            .collect();
+
+        for (id, scale) in detected {
+            let current = self.applied_scales.get(&id).copied().unwrap_or(0.0);
+            if (scale - current).abs() > 0.01 {
+                log::info!(
+                    "iced_webview: view {id} is on a {scale:.2}x display (was {current:.2}x)"
+                );
+                self.applied_scales.insert(id, scale);
+                self.engine.set_view_scale_factor(id, scale);
+            }
         }
     }
 
@@ -235,6 +249,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         match action {
             Action::CloseView(id) => {
                 self.engine.remove_view(id);
+                self.detected_scales.remove(&id);
+                self.applied_scales.remove(&id);
                 self.urls.retain(|url| url.0 != id);
                 self.titles.retain(|title| title.0 != id);
 
@@ -274,6 +290,9 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
 
                 self.urls.push((id, String::new()));
                 self.titles.push((id, String::new()));
+                self.detected_scales
+                    .entry(id)
+                    .or_insert_with(|| Arc::new(AtomicU32::new(0)));
 
                 if let Some(on_view_create) = &self.on_create_view {
                     tasks.push(Task::done((on_view_create)(id)))
@@ -545,7 +564,10 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     id,
                     self.engine.get_view(id),
                     self.engine.get_cursor(id),
-                    self.detected_scale.clone(),
+                    self.detected_scales
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| Arc::new(AtomicU32::new(0))),
                 ))
                 .width(Length::Fill)
                 .height(Length::Fill)

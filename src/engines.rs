@@ -130,6 +130,17 @@ pub trait Engine {
     /// Set the display scale factor for HiDPI rendering. Default is no-op.
     fn set_scale_factor(&mut self, _scale: f32) {}
 
+    /// Set the scale factor of a single view.
+    ///
+    /// Views can be on displays with different scale factors at the same time,
+    /// in which case one engine-wide value cannot be right for both: each
+    /// surface overwrites the other's and every view is re-rasterized at the
+    /// wrong size. Engines without per-view scaling fall back to setting it
+    /// for everything.
+    fn set_view_scale_factor(&mut self, _id: ViewId, scale: f32) {
+        self.set_scale_factor(scale);
+    }
+
     /// Set the default background color for new views. The color is in ARGB
     /// u32 format (e.g. 0xFF1A1A1A for opaque dark gray). Default is no-op.
     fn set_background_color(&mut self, _color: u32) {}

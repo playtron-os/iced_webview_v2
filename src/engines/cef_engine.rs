@@ -1742,6 +1742,26 @@ impl Engine for Cef {
         }
     }
 
+    fn set_view_scale_factor(&mut self, id: ViewId, scale: f32) {
+        let Some(view) = self.views.iter_mut().find(|v| v.id == id) else {
+            return;
+        };
+        {
+            let mut shared = view.shared.borrow_mut();
+            if (shared.scale_factor - scale).abs() < f32::EPSILON {
+                return;
+            }
+            shared.scale_factor = scale;
+            let size = shared.size;
+            shared.expect_frame_at(size);
+        }
+        if let Some(host) = view.browser.host() {
+            host.notify_screen_info_changed();
+            host.was_resized();
+        }
+        view.needs_render = true;
+    }
+
     fn set_scale_factor(&mut self, scale: f32) {
         if (self.scale_factor - scale).abs() < f32::EPSILON {
             return;
