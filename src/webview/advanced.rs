@@ -189,6 +189,21 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self
     }
 
+    /// Whether a view has been rendered at the size it is displayed at.
+    ///
+    /// False for the first frames of a view's life, during which it
+    /// deliberately draws nothing rather than show the page at the wrong size.
+    /// This is the earliest honest answer to "would the user see this view
+    /// now" — a committed buffer is not, since the surface may still be
+    /// transparent, and the page reporting that it painted says only that the
+    /// browser drew, not that we have a texture for it.
+    pub fn is_settled(&self, id: ViewId) -> bool {
+        self.engine
+            .get_view(id)
+            .accelerated()
+            .is_some_and(|surface| surface.is_settled())
+    }
+
     /// Subscribe to console messages (`console.log`/`warn`/`error`/…) emitted
     /// by pages in **any** view.
     ///
