@@ -130,13 +130,6 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
             other => other,
         };
     }
-
-    fn index_as_view_id(&self, index: u32) -> usize {
-        *self
-            .view_ids
-            .get(index as usize)
-            .expect("Failed to find that index, maybe its already been closed?")
-    }
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
@@ -386,9 +379,19 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
 
         match action {
             Action::ChangeView(index) => {
+                // Hosts drive this from their own state, so the index can name
+                // a view that never existed or has since closed. Storing it
+                // regardless left `current_view_index` dangling, which panicked
+                // here and again in every later lookup that trusts it.
+                let Some(id) = self.view_ids.get(index as usize).copied() else {
+                    log::warn!(
+                        "iced_webview: ignoring ChangeView({index}); {} view(s) open",
+                        self.view_ids.len()
+                    );
+                    return Task::batch(tasks);
+                };
                 self.current_view_index = Some(index as usize);
-                self.engine
-                    .request_render(self.index_as_view_id(index), self.view_size);
+                self.engine.request_render(id, self.view_size);
             }
             Action::CloseCurrentView => {
                 // A no-op rather than a panic: closing twice is an

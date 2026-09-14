@@ -223,7 +223,7 @@ impl OsrRenderHandler {
     /// lets the next page paint restore what was covered.
     fn blit_popup(&self, buffer: *const u8, width: c_int, height: c_int) {
         let (pw, ph) = (width.max(0) as usize, height.max(0) as usize);
-        if pw == 0 || ph == 0 {
+        if buffer.is_null() || pw == 0 || ph == 0 {
             return;
         }
         let mut shared = self.shared.borrow_mut();
@@ -602,6 +602,12 @@ wrap_render_handler! {
                 }
             }
 
+            // CEF owns this buffer. A null pointer or a non-positive size
+            // would turn the slice below into a read of arbitrary memory —
+            // negative dimensions sign-extend into enormous lengths.
+            if buffer.is_null() || width <= 0 || height <= 0 {
+                return;
+            }
             let w = width as u32;
             let h = height as u32;
             let stride = (w as usize) * 4;

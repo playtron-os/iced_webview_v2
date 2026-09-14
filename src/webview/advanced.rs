@@ -198,10 +198,21 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     /// transparent, and the page reporting that it painted says only that the
     /// browser drew, not that we have a texture for it.
     pub fn is_settled(&self, id: ViewId) -> bool {
-        self.engine
-            .get_view(id)
-            .accelerated()
-            .is_some_and(|surface| surface.is_settled())
+        #[cfg(feature = "cef")]
+        {
+            self.engine
+                .get_view(id)
+                .accelerated()
+                .is_some_and(|surface| surface.is_settled())
+        }
+        // Only the accelerated path has a capture whose resolution lags the
+        // view, so there is nothing to settle without it: CPU frames arrive at
+        // the size they were asked for.
+        #[cfg(not(feature = "cef"))]
+        {
+            let _ = id;
+            true
+        }
     }
 
     /// Subscribe to console messages (`console.log`/`warn`/`error`/…) emitted

@@ -30,6 +30,35 @@ use iced::wgpu;
 /// explicit-modifier path cannot do — see the check in [`AcceleratedSurface::accept_frame`].
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
+/// How long to wait for one frame copy before giving up on it.
+///
+/// The copy itself is measured in fractions of a millisecond, so this is pure
+/// headroom. It exists because the wait runs on the same thread that services
+/// Wayland: with no bound, a wedged GPU freezes the event loop until the
+/// compositor gives up on the client and the process dies with it.
+const FRAME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Consecutive copy timeouts after which the GPU path is abandoned.
+///
+/// A GPU that stops retiring work never reports itself lost, so repeated
+/// timeouts are the only evidence that it is never coming back.
+const MAX_CONSECUTIVE_TIMEOUTS: u64 = 30;
+
+/// What waiting for one frame copy established about the device.
+enum CopyWait {
+    /// The copy completed; the browser's buffer is safe to hand back.
+    Done,
+    /// This frame was lost, but the device is still usable.
+    ///
+    /// The copy may still be in flight when the browser reclaims the buffer it
+    /// reads from, so the next frame can tear. That is the deliberate trade:
+    /// a torn frame beats blocking the Wayland thread until the client is
+    /// dropped.
+    Retry,
+    /// The device cannot be used again.
+    Dead,
+}
+
 /// Hands out texture generations that are unique across every surface in the
 /// process. See [`AcceleratedSurface::generation`].
 fn next_generation() -> u64 {
@@ -166,6 +195,13 @@ pub struct AcceleratedSurface {
     /// When the first frame arrived, so waiting for a correctly-sized one can
     /// be given up on. See [`Self::settle_deadline_passed`].
     first_frame_at: Mutex<Option<std::time::Instant>>,
+    /// Latched once this surface's GPU can no longer be used.
+    ///
+    /// Shared with the device-lost callback registered in [`Self::attach_gpu`],
+    /// which is why it is an `Arc` and not a plain flag.
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Consecutive frame-copy timeouts, reset by any copy that completes.
+    timeouts: AtomicU64,
 }
 
 impl std::fmt::Debug for AcceleratedSurface {
@@ -199,6 +235,14 @@ impl AcceleratedSurface {
         let mut gpu = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
         match gpu.as_mut() {
             None => {
+                // Once a device is lost every later call on it is fatal —
+                // `poll` panics rather than returning an error — so learn
+                // about it when it happens and stop touching it.
+                let dead = Arc::clone(&self.dead);
+                device.set_device_lost_callback(move |reason, message| {
+                    log::error!("iced_webview: GPU device lost ({reason:?}): {message}");
+                    dead.store(true, Ordering::Relaxed);
+                });
                 *gpu = Some(Gpu {
                     device: device.clone(),
                     queue: queue.clone(),
@@ -272,6 +316,61 @@ impl AcceleratedSurface {
         ))
     }
 
+    /// Whether the GPU path has been abandoned, because the device was lost
+    /// or stopped retiring work. Frames are dropped from then on; the view
+    /// keeps whatever it last drew.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
+    }
+
+    /// Wait for one frame copy to finish, bounded and without trusting the
+    /// device to stay alive.
+    ///
+    /// This runs on the thread that also services Wayland, so neither failure
+    /// mode may be left to `wgpu`'s defaults: an unbounded wait turns a wedged
+    /// GPU into a frozen event loop, and `Device::poll` *panics* once the
+    /// device is lost (anything that is not a timeout or a bad submission
+    /// index reaches `handle_error_fatal`), which would abort the process from
+    /// inside a paint callback.
+    fn await_copy(&self, device: &wgpu::Device, submission: wgpu::SubmissionIndex) -> CopyWait {
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: Some(FRAME_COPY_TIMEOUT),
+            })
+        }));
+
+        match polled {
+            Ok(Ok(_)) => {
+                self.timeouts.store(0, Ordering::Relaxed);
+                CopyWait::Done
+            }
+            Ok(Err(wgpu::PollError::Timeout)) => {
+                let n = self.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= MAX_CONSECUTIVE_TIMEOUTS {
+                    log::error!(
+                        "iced_webview: the GPU stopped retiring browser frames \
+                         ({n} consecutive timeouts); abandoning the GPU path"
+                    );
+                    CopyWait::Dead
+                } else {
+                    CopyWait::Retry
+                }
+            }
+            Ok(Err(e)) => {
+                log::warn!("iced_webview: waiting for the frame copy failed: {e:?}");
+                CopyWait::Retry
+            }
+            Err(_) => {
+                log::error!(
+                    "iced_webview: the GPU device was lost while copying a browser \
+                     frame; the view stops updating rather than taking the process down"
+                );
+                CopyWait::Dead
+            }
+        }
+    }
+
     /// Import one frame and copy it into our own texture.
     ///
     /// Returns `false` if the frame could not be taken — no device yet, or the
@@ -281,6 +380,9 @@ impl AcceleratedSurface {
     /// Blocks until the copy has executed. See the module docs: the caller's
     /// buffer goes back to the browser's pool as soon as this returns.
     pub fn accept_frame(&self, frame: &DmabufFrame) -> bool {
+        if self.is_dead() {
+            return false;
+        }
         let gpu = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
         let Some(gpu) = gpu.as_ref() else {
             return false;
@@ -382,12 +484,13 @@ impl AcceleratedSurface {
 
         // The imported texture aliases memory the browser is about to reuse,
         // so the copy has to be finished, not merely queued, before we return.
-        if let Err(e) = gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: None,
-        }) {
-            log::warn!("iced_webview: waiting for the frame copy failed: {e:?}");
-            return false;
+        match self.await_copy(&gpu.device, submission) {
+            CopyWait::Done => {}
+            CopyWait::Retry => return false,
+            CopyWait::Dead => {
+                self.dead.store(true, Ordering::Relaxed);
+                return false;
+            }
         }
 
         let n = self.frames.fetch_add(1, Ordering::Relaxed) + 1;
