@@ -887,15 +887,36 @@ wrap_load_handler! {
             error_text: Option<&CefString>,
             failed_url: Option<&CefString>,
         ) {
+            // ERR_ABORTED is not a failure: it is what a navigation reports
+            // when a newer one superseded it — the page asked for twice in a
+            // row, the second with its images in. Chromium shows nothing for
+            // it, and neither may we. Loading an error page here NAVIGATES,
+            // which aborts the load that superseded ours, which lands back in
+            // this handler for that one — and again for each error page after
+            // it, every ~30ms and each embedding the last failed URL, while
+            // the view goes on showing whatever committed before the loop.
+            if error_code == Errorcode::ABORTED {
+                return;
+            }
+
             let text = error_text.map(ToString::to_string).unwrap_or_default();
             let url = failed_url.map(ToString::to_string).unwrap_or_default();
-            log::warn!("iced_webview: load failed ({error_code:?}) for {url}: {text}");
+            log::warn!(
+                "iced_webview: load failed ({error_code:?}) for {}: {text}",
+                url.chars().take(160).collect::<String>()
+            );
+
+            // Never cover a failed error page with another: that is a loop by
+            // another route, with the page doubling in size each turn.
+            if url.starts_with(ERROR_PAGE_PREFIX) {
+                return;
+            }
 
             let Some(frame) = frame else { return };
             let body = format!(
-                "<html><body style=\"font-family:sans-serif;padding:2rem\">\
+                "{ERROR_PAGE_HEAD}\
                  <h2>Failed to load</h2><p>{}</p><p style=\"color:#666\">{}</p></body></html>",
-                html_escape(&url),
+                html_escape(&url.chars().take(512).collect::<String>()),
                 html_escape(&text),
             );
             let data_url = format!(
@@ -906,6 +927,14 @@ wrap_load_handler! {
         }
     }
 }
+
+/// The start of the inline error page `on_load_error` renders.
+const ERROR_PAGE_HEAD: &str = "<html><body style=\"font-family:sans-serif;padding:2rem\">";
+
+/// How the error page's own URL begins once it is a `data:` URL, so a failure
+/// of the error page itself is recognised rather than answered with another.
+const ERROR_PAGE_PREFIX: &str =
+    "data:text/html;charset=utf-8,%3Chtml%3E%3Cbody%20style%3D%22font-family%3Asans-serif";
 
 /// Minimal HTML escaping for text interpolated into the error page.
 fn html_escape(value: &str) -> String {
