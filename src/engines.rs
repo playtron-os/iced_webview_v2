@@ -83,6 +83,14 @@ pub type ViewId = usize;
 pub trait Engine {
     /// Used to do work in the actual browser engine
     fn update(&mut self);
+    /// Whether a view is still owed a frame — resized, and not yet painted at
+    /// its new size. Only [`Self::update`] collects it, so a host that pumps
+    /// the engine less often than it redraws (on the window's frames, say,
+    /// which a compositor throttles for a window it is not showing) should
+    /// pump on a clock while this holds.
+    fn owes_frame(&self) -> bool {
+        false
+    }
     /// Request a new render pass from the engine
     fn render(&mut self, size: Size<u32>);
     /// Flush a pending render for a specific view, if one is needed.

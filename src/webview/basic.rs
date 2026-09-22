@@ -239,6 +239,14 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.take_eval_results(view_id)
     }
 
+    /// Whether the engine is still owed a frame — resized, and not yet painted
+    /// at its new size. [`Action::Update`] is what collects it: pump that on a
+    /// clock while this holds, not only on the window's frames, which a
+    /// compositor may deliver once a second to a window it is not showing.
+    pub fn owes_frame(&self) -> bool {
+        self.engine.owes_frame()
+    }
+
     /// Whether the focused element in the current view accepts text.
     pub fn has_editable_focus(&self) -> bool {
         self.current_view_id()

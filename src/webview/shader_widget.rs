@@ -731,10 +731,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Anchor the page at the top-left at 1:1 rather than stretching it over
     // the widget. While a resize settles the page is briefly a different size
     // than the widget, and scaling it to fit makes the whole view rubber-band
-    // on every drag; anchoring keeps the content still and only the newly
-    // exposed strip is wrong for a frame. The sampler clamps to edge, so that
-    // strip repeats the border pixels instead of showing a hole.
-    var color = textureSample(t_texture, t_sampler, in.uv * anchor.uv_scale);
+    // on every drag; anchoring keeps the content still.
+    let uv = in.uv * anchor.uv_scale;
+    // Sampled before the discard below, which would otherwise put the sample
+    // in non-uniform control flow.
+    var color = textureSample(t_texture, t_sampler, uv);
+    // Past the edge of a frame rendered for a smaller view there is nothing
+    // of the page to show yet, so show nothing and let whatever is behind the
+    // widget through. Clamp-to-edge sampling used to fill that strip with the
+    // frame's last row and column, smeared across it as streaks for as long
+    // as the browser took to paint the new size — which on a static page, in
+    // a window the compositor has throttled, is up to a second. A texel of
+    // slack keeps the pixel of rounding between logical and physical sizes
+    // from carving a line off the edge of a view that does fit.
+    let limit = vec2<f32>(1.0, 1.0) + 1.0 / vec2<f32>(textureDimensions(t_texture));
+    if (uv.x > limit.x || uv.y > limit.y) {
+        discard;
+    }
     color.a = 1.0;
     return color;
 }

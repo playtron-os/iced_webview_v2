@@ -163,6 +163,10 @@ struct Target {
 pub struct AcceleratedSurface {
     gpu: Mutex<Option<Gpu>>,
     target: Mutex<Option<Target>>,
+    /// The frame `target` held before the view last changed size — the page as
+    /// it was at that size, kept so a view resized straight back to it can
+    /// show it at once. See [`Self::recall`].
+    previous: Mutex<Option<Target>>,
     /// Changes whenever the texture *identity* does, so a caller caching a bind
     /// group knows when to rebuild it. Frame contents changing does not change
     /// it — we copy into the same texture.
@@ -252,6 +256,7 @@ impl AcceleratedSurface {
             Some(existing) if existing.target_format != target_format => {
                 existing.target_format = target_format;
                 *self.target.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 self.generation.store(next_generation(), Ordering::Relaxed);
             }
             Some(_) => {}
@@ -314,6 +319,36 @@ impl AcceleratedSurface {
             Arc::clone(&target.texture),
             self.generation.load(Ordering::Relaxed),
         ))
+    }
+
+    /// Show the frame the view last had at `size` again, until the browser
+    /// paints a fresh one. Answers whether there was one.
+    ///
+    /// A panel opening and closing under a view resizes it away and straight
+    /// back, and until the browser repaints at the restored size all there is
+    /// to show is the frame from the size in between. Anchored in a view too
+    /// big for it, that is the top of the page over an empty strip — for a
+    /// frame or two in the foreground, and for up to a second when the window
+    /// is not being drawn often. The frame it had at this size is the page as
+    /// it stood before the panel came, which is almost always the page as it
+    /// stands now.
+    ///
+    /// "Almost": a page that has since changed shows its old self until the
+    /// fresh frame lands, so a navigation must [`Self::forget_previous`].
+    pub fn recall(&self, size: (u32, u32)) -> bool {
+        let mut target = self.target.lock().unwrap_or_else(|e| e.into_inner());
+        let mut previous = self.previous.lock().unwrap_or_else(|e| e.into_inner());
+        if previous.as_ref().is_none_or(|p| p.size != size) {
+            return false;
+        }
+        std::mem::swap(&mut *target, &mut *previous);
+        self.generation.store(next_generation(), Ordering::Relaxed);
+        true
+    }
+
+    /// Drop the frame kept for [`Self::recall`] — the page it shows is gone.
+    pub fn forget_previous(&self) {
+        *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Whether the GPU path has been abandoned, because the device was lost
@@ -435,7 +470,7 @@ impl AcceleratedSurface {
             None => true,
         };
         if needs_new {
-            *target = Some(Target {
+            let replaced = target.replace(Target {
                 texture: Arc::new(create_target(
                     &gpu.device,
                     frame.width,
@@ -445,6 +480,14 @@ impl AcceleratedSurface {
                 size: (frame.width, frame.height),
                 format: gpu.target_format,
             });
+            // Kept rather than dropped, for `recall`. Not across a format
+            // change, which leaves nothing that could be sampled as it was.
+            if replaced
+                .as_ref()
+                .is_some_and(|r| r.format == gpu.target_format)
+            {
+                *self.previous.lock().unwrap_or_else(|e| e.into_inner()) = replaced;
+            }
             // Identity changed — anything caching a view of it must rebuild.
             self.generation.store(next_generation(), Ordering::Relaxed);
         }

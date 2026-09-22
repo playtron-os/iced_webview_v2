@@ -141,6 +141,10 @@ struct SharedState {
     /// that by asking for frames until one arrives at the size CEF expects.
     expected_pixels: Option<(u32, u32)>,
     expect_until: Option<std::time::Instant>,
+    /// Whether the frame on show is one recalled for `expected_pixels` — the
+    /// page as it last stood at that size — rather than the last one painted.
+    /// See `AcceleratedSurface::recall`.
+    standing_in: bool,
     /// Persistent pixel buffer reused across on_paint calls. Dirty rects
     /// are blitted into it via `Arc::make_mut` (copy-on-write: only copies
     /// if the shader still holds a reference to the previous frame).
@@ -186,6 +190,12 @@ impl SharedState {
         let pixels = |v: u32| ((v as f32) * self.scale_factor).ceil() as u32;
         self.expected_pixels = Some((pixels(size.width), pixels(size.height)));
         self.expect_until = Some(std::time::Instant::now() + Self::EXPECT_TIMEOUT);
+        // Until CEF paints this size, show the page as it last stood at it,
+        // if it has been this size before — a panel under it opening and
+        // closing again — rather than a frame of the size in between.
+        self.standing_in = self
+            .expected_pixels
+            .is_some_and(|size| self.accelerated.recall(size));
     }
 
     /// Whether to ask CEF for another frame this tick.
@@ -200,6 +210,7 @@ impl SharedState {
         if self.accelerated_size == expected {
             self.expected_pixels = None;
             self.expect_until = None;
+            self.standing_in = false;
             return false;
         }
         match self.expect_until {
@@ -209,6 +220,7 @@ impl SharedState {
                 // tick re-check a size that is never going to arrive.
                 self.expected_pixels = None;
                 self.expect_until = None;
+                self.standing_in = false;
                 false
             }
         }
@@ -713,6 +725,17 @@ wrap_render_handler! {
                 },
             };
 
+            // A recalled frame standing in for the size CEF owes is the right
+            // picture. The first capture after a resize usually still carries
+            // the old size, letterboxed — accepting it would swap the page for
+            // a thumbnail of itself until the frame that is owed arrives.
+            {
+                let shared = self.shared.borrow();
+                if shared.standing_in && shared.expected_pixels != Some((width, height)) {
+                    return;
+                }
+            }
+
             // Take the surface out from under the borrow: importing blocks on
             // the GPU, and holding the `RefCell` across that would deadlock
             // any handler that runs in the meantime.
@@ -860,6 +883,11 @@ wrap_load_handler! {
         ) {
             if is_loading == 0 {
                 self.shared.borrow_mut().page_loaded = true;
+            } else {
+                // A new page: the frame kept for `recall` shows the old one.
+                let mut shared = self.shared.borrow_mut();
+                shared.accelerated.forget_previous();
+                shared.standing_in = false;
             }
         }
 
@@ -1449,6 +1477,7 @@ impl Cef {
             accelerated_seen: 0,
             expected_pixels: None,
             expect_until: None,
+            standing_in: false,
             persistent_buffer: Arc::new(Vec::new()),
             persistent_size: (0, 0),
             url: None,
@@ -1562,6 +1591,12 @@ fn cursor_type_to_interaction(cursor: CursorType) -> Interaction {
 impl Engine for Cef {
     fn handles_urls(&self) -> bool {
         true
+    }
+
+    fn owes_frame(&self) -> bool {
+        self.views
+            .iter()
+            .any(|view| view.shared.borrow().expected_pixels.is_some())
     }
 
     fn update(&mut self) {
