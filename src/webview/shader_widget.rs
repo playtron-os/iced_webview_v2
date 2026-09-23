@@ -8,7 +8,7 @@ use iced::{keyboard, touch, Event, Point, Rectangle, Size};
 
 use crate::engines::PixelFormat;
 use crate::webview::basic::Action;
-use crate::webview::{is_touch_release, touch_to_mouse};
+use crate::webview::is_touch_release;
 use crate::ImageInfo;
 
 /// Shader-based rendering for servo webview content.
@@ -39,8 +39,6 @@ impl<'a> WebViewShaderProgram<'a> {
 #[derive(Default)]
 pub struct ShaderState {
     bounds: Size<u32>,
-    /// Whether the webview has keyboard focus (user clicked inside it).
-    focused: bool,
     /// Current keyboard modifier state (shift, ctrl, alt).
     modifiers: keyboard::Modifiers,
     /// Mouse button held inside the webview — continue forwarding events
@@ -538,34 +536,18 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                         state.modifiers = *modifiers;
                     }
                 }
-                // Only forward keyboard events when the webview is focused
-                // (user clicked inside it). This prevents keystrokes meant
-                // for the chat input from also reaching the webview.
-                if !state.focused {
-                    return None;
-                }
-                if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                } = event
-                {
-                    if modifiers.command() && c.as_str() == "c" {
-                        return Some(shader::Action::publish(Action::CopySelection));
-                    }
-                }
-                Some(shader::Action::publish(Action::SendKeyboardEvent(
-                    event.clone(),
-                )))
+                // Keys reach the engine through the frame around this widget,
+                // which knows whether the view has the keyboard — see
+                // `webview::focus`. Here they only keep the modifiers a mouse
+                // or touch event carries up to date.
+                None
             }
             Event::Mouse(event) => {
-                // Track focus: clicking inside grants focus, clicking outside loses it.
-                if matches!(event, mouse::Event::ButtonPressed(_)) {
-                    let inside = cursor.position_in(bounds).is_some();
-                    state.focused = inside;
-                    if inside {
-                        state.dragging = true;
-                    }
+                // A press on the page starts a drag the view follows off its edge.
+                if matches!(event, mouse::Event::ButtonPressed(_))
+                    && cursor.position_in(bounds).is_some()
+                {
+                    state.dragging = true;
                 }
                 let was_dragging = state.dragging;
                 if matches!(event, mouse::Event::ButtonReleased(_)) {
@@ -627,39 +609,32 @@ impl<'a> shader::Program<Action> for WebViewShaderProgram<'a> {
                 }
             }
             Event::Touch(touch_event) => {
-                // Emulate mouse input for the engine (tap = click, drag = move).
-                let synthetic = touch_to_mouse(touch_event);
+                // Handed to the engine as a touch, not dressed up as the mouse —
+                // see `Engine::handle_touch_event`.
+                let (touch::Event::FingerPressed { position, .. }
+                | touch::Event::FingerMoved { position, .. }
+                | touch::Event::FingerLifted { position, .. }
+                | touch::Event::FingerLost { position, .. }) = touch_event;
+                let inside = bounds.contains(*position);
                 let released = is_touch_release(touch_event);
 
-                if matches!(touch_event, touch::Event::FingerPressed { .. }) {
-                    let inside = cursor.position_in(bounds).is_some();
-                    state.focused = inside;
-                    if inside {
-                        state.dragging = true;
-                    }
+                if matches!(touch_event, touch::Event::FingerPressed { .. }) && inside {
+                    state.dragging = true;
                 }
                 let was_dragging = state.dragging;
                 if released {
                     state.dragging = false;
                 }
 
-                if let Some(point) = cursor.position_in(bounds) {
-                    Some(shader::Action::publish(Action::SendMouseEvent(
-                        synthetic,
-                        point,
+                // A gesture that began on the page follows the finger off it,
+                // so the engine sees it end rather than stall mid-scroll.
+                (inside || was_dragging).then(|| {
+                    shader::Action::publish(Action::SendTouchEvent(
+                        *touch_event,
+                        Point::new(position.x - bounds.x, position.y - bounds.y),
                         state.modifiers,
-                    )))
-                } else if was_dragging && released {
-                    // Finger lifted/cancelled outside the view while dragging —
-                    // send a release so the engine ends its drag state.
-                    Some(shader::Action::publish(Action::SendMouseEvent(
-                        mouse::Event::ButtonReleased(mouse::Button::Left),
-                        Point::ORIGIN,
-                        state.modifiers,
-                    )))
-                } else {
-                    None
-                }
+                    ))
+                })
             }
             _ => None,
         }

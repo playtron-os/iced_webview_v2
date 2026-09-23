@@ -34,6 +34,8 @@ pub use engines::{ConsoleMessage, Engine, PageType, PixelFormat, ViewId};
 
 mod webview;
 pub use basic::{Action, WebView};
+#[cfg(any(feature = "servo", feature = "cef"))]
+pub use webview::focus::FocusRing;
 pub use webview::{advanced, basic};
 
 #[cfg(feature = "blitz")]

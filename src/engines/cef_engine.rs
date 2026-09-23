@@ -2070,6 +2070,50 @@ impl Engine for Cef {
         }
     }
 
+    // Real touches, not the mouse: Chromium turns a finger dragged over the
+    // page into a scroll — with its own fling — and a tap into a click, where
+    // the mouse emulation this replaced turned every drag into a text
+    // selection and left a page on a touch screen unscrollable.
+    fn handle_touch_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: iced::touch::Event,
+        modifiers: keyboard::Modifiers,
+    ) {
+        let Some(view) = self.find_view_mut(id) else {
+            return;
+        };
+        let Some(host) = view.browser.host() else {
+            return;
+        };
+        let (finger, type_) = match event {
+            iced::touch::Event::FingerPressed { id, .. } => {
+                // As a click does: the page takes the keyboard where it is touched.
+                host.set_focus(1);
+                (id, TouchEventType::PRESSED)
+            }
+            iced::touch::Event::FingerMoved { id, .. } => (id, TouchEventType::MOVED),
+            iced::touch::Event::FingerLifted { id, .. } => (id, TouchEventType::RELEASED),
+            iced::touch::Event::FingerLost { id, .. } => (id, TouchEventType::CANCELLED),
+        };
+        let touch = TouchEvent {
+            // Chromium tracks each finger by this id across the gesture; iced's
+            // are unique per contact, which is all that is needed of them.
+            id: (finger.0 % i32::MAX as u64) as i32,
+            x: point.x,
+            y: point.y,
+            radius_x: 0.0,
+            radius_y: 0.0,
+            rotation_angle: 0.0,
+            pressure: 0.0,
+            type_,
+            modifiers: iced_modifiers_to_cef(modifiers),
+            pointer_type: PointerType::TOUCH,
+        };
+        host.send_touch_event(Some(&touch));
+    }
+
     fn scroll(&mut self, id: ViewId, point: Point, delta: mouse::ScrollDelta) {
         let Some(view) = self.find_view_mut(id) else {
             return;

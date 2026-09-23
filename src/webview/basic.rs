@@ -38,6 +38,14 @@ pub enum Action {
     Refresh,
     SendKeyboardEvent(keyboard::Event),
     SendMouseEvent(mouse::Event, Point, keyboard::Modifiers),
+    /// A touch on the view, at a point in its own coordinates. See
+    /// [`Engine::handle_touch_event`](crate::Engine::handle_touch_event).
+    SendTouchEvent(iced::touch::Event, Point, keyboard::Modifiers),
+    /// Give the page the keyboard, as a click in it does — for a host that
+    /// moves focus onto the view with the keyboard instead.
+    Focus,
+    /// Take the keyboard away from the page.
+    Unfocus,
     /// Allows users to control when the browser engine proccesses interactions in subscriptions
     Update,
     Resize(Size<u32>),
@@ -97,6 +105,9 @@ where
     detected_scale: Arc<AtomicU32>,
     /// Counter handing out ids for `evaluate_javascript` round trips.
     next_eval_id: u32,
+    /// How the view shows it has the keyboard; see [`WebView::focus_ring`].
+    #[cfg(any(feature = "servo", feature = "cef"))]
+    focus_ring: Option<crate::webview::focus::FocusRing>,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView<Engine, Message> {
@@ -160,6 +171,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             nav_epochs: HashMap::new(),
             detected_scale: Arc::new(AtomicU32::new(0)),
             next_eval_id: 0,
+            #[cfg(any(feature = "servo", feature = "cef"))]
+            focus_ring: None,
         }
     }
 }
@@ -168,6 +181,18 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     /// Create new basic WebView widget
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Show keyboard focus on the view with the host's own ring.
+    ///
+    /// The view is a focus stop either way — Tab reaches it, and while it has
+    /// the keyboard the page does (see [`crate::webview::focus`]) — but without
+    /// a ring nothing on screen says so.
+    #[cfg(any(feature = "servo", feature = "cef"))]
+    #[must_use]
+    pub fn focus_ring(mut self, ring: crate::webview::focus::FocusRing) -> Self {
+        self.focus_ring = Some(ring);
+        self
     }
 
     /// Set the display scale factor for HiDPI rendering.
@@ -508,6 +533,13 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 self.engine
                     .handle_keyboard_event(self.get_current_view_id(), event);
             }
+            Action::SendTouchEvent(event, point, modifiers) => {
+                let view_id = self.get_current_view_id();
+                self.engine
+                    .handle_touch_event(view_id, point, event, modifiers);
+            }
+            Action::Focus => self.engine.focus(),
+            Action::Unfocus => self.engine.unfocus(),
             Action::SendMouseEvent(event, point, modifiers) => {
                 let view_id = self.get_current_view_id();
                 self.engine
@@ -720,14 +752,16 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
             #[cfg(any(feature = "servo", feature = "cef"))]
             {
                 use crate::webview::shader_widget::WebViewShaderProgram;
-                iced::widget::Shader::new(WebViewShaderProgram::new(
-                    self.engine.get_view(id),
-                    self.engine.get_cursor(id),
-                    self.detected_scale.clone(),
-                ))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
+                let page: Element<'a, Action, T> =
+                    iced::widget::Shader::new(WebViewShaderProgram::new(
+                        self.engine.get_view(id),
+                        self.engine.get_cursor(id),
+                        self.detected_scale.clone(),
+                    ))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
+                crate::webview::focus::KeyboardFrame::new(page, self.focus_ring).into()
             }
             #[cfg(not(any(feature = "servo", feature = "cef")))]
             {

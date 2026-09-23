@@ -101,3 +101,5 @@ name = "gpuinfo"
 
 [dev-dependencies]
 env_logger = "0.11"
+# Headless widget tests, from the same iced as the crate itself.
+iced_test = { git = "https://github.com/playtron-os/iced.git" }

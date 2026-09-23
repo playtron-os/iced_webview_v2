@@ -219,6 +219,21 @@ pub trait Engine {
         event: mouse::Event,
         modifiers: keyboard::Modifiers,
     );
+    /// Handles a touch on the view, at `point` in its own coordinates.
+    ///
+    /// Engines with no touch input of their own get it as the mouse: a finger
+    /// down is a press, a drag is a move with the button held. That selects
+    /// text where a finger means to scroll, so an engine that can take real
+    /// touches should.
+    fn handle_touch_event(
+        &mut self,
+        id: ViewId,
+        point: Point,
+        event: iced::touch::Event,
+        modifiers: keyboard::Modifiers,
+    ) {
+        self.handle_mouse_event(id, point, crate::webview::touch_to_mouse(&event), modifiers);
+    }
     /// Handles scrolling on view
     fn scroll(&mut self, id: ViewId, point: Point, delta: mouse::ScrollDelta);
 

@@ -33,6 +33,10 @@ pub mod advanced;
 /// allows users to index views by ints like 0, 1 , or 2
 pub mod basic;
 
+/// The view as a stop in the host's keyboard focus.
+#[cfg(any(feature = "servo", feature = "cef"))]
+pub mod focus;
+
 /// Shader-based rendering widget for engines that manage their own scrolling
 /// (e.g. servo, cef). Uses direct GPU texture updates to avoid Handle cache churn.
 #[cfg(any(feature = "servo", feature = "cef"))]
