@@ -38,17 +38,35 @@ pub struct FocusRing {
     pub visible: fn() -> bool,
 }
 
+/// How the view holds the keyboard, for a host whose page is the whole screen
+/// rather than one control among others.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Keyboard {
+    /// Take the keyboard as the view appears, so the field a page focuses on
+    /// load gets the keys without a click on it first.
+    pub autofocus: bool,
+    /// Keep Tab for the page, to move between its own fields. Only where the
+    /// view has the screen to itself: elsewhere it would trap focus.
+    pub keeps_tab: bool,
+}
+
 pub(crate) struct KeyboardFrame<'a, Theme> {
     content: Element<'a, Action, Theme, Renderer>,
     ring: Option<FocusRing>,
+    keyboard: Keyboard,
 }
 
 impl<'a, Theme> KeyboardFrame<'a, Theme> {
     pub(crate) fn new(
         content: Element<'a, Action, Theme, Renderer>,
         ring: Option<FocusRing>,
+        keyboard: Keyboard,
     ) -> Self {
-        Self { content, ring }
+        Self {
+            content,
+            ring,
+            keyboard,
+        }
     }
 }
 
@@ -79,7 +97,10 @@ impl<Theme> Widget<Action, Theme, Renderer> for KeyboardFrame<'_, Theme> {
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(FrameState::default())
+        widget::tree::State::new(FrameState {
+            focused: self.keyboard.autofocus,
+            told: false,
+        })
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -165,7 +186,7 @@ impl<Theme> Widget<Action, Theme, Renderer> for KeyboardFrame<'_, Theme> {
                 | keyboard::Event::KeyReleased {
                     key: Key::Named(Named::Tab),
                     ..
-                } => {}
+                } if !self.keyboard.keeps_tab => {}
                 keyboard::Event::KeyPressed {
                     key: Key::Character(c),
                     modifiers,

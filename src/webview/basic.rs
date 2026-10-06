@@ -108,6 +108,9 @@ where
     /// How the view shows it has the keyboard; see [`WebView::focus_ring`].
     #[cfg(any(feature = "servo", feature = "cef"))]
     focus_ring: Option<crate::webview::focus::FocusRing>,
+    /// How the view holds the keyboard; see [`WebView::keyboard`].
+    #[cfg(any(feature = "servo", feature = "cef"))]
+    keyboard: crate::webview::focus::Keyboard,
 }
 
 impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView<Engine, Message> {
@@ -173,6 +176,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> Default
             next_eval_id: 0,
             #[cfg(any(feature = "servo", feature = "cef"))]
             focus_ring: None,
+            #[cfg(any(feature = "servo", feature = "cef"))]
+            keyboard: crate::webview::focus::Keyboard::default(),
         }
     }
 }
@@ -192,6 +197,15 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     #[must_use]
     pub fn focus_ring(mut self, ring: crate::webview::focus::FocusRing) -> Self {
         self.focus_ring = Some(ring);
+        self
+    }
+
+    /// How the view holds the keyboard: from the moment it appears, and with
+    /// Tab kept for the page, as a view that is the whole screen wants.
+    #[cfg(any(feature = "servo", feature = "cef"))]
+    #[must_use]
+    pub fn keyboard(mut self, keyboard: crate::webview::focus::Keyboard) -> Self {
+        self.keyboard = keyboard;
         self
     }
 
@@ -770,7 +784,8 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .into();
-                crate::webview::focus::KeyboardFrame::new(page, self.focus_ring).into()
+                crate::webview::focus::KeyboardFrame::new(page, self.focus_ring, self.keyboard)
+                    .into()
             }
             #[cfg(not(any(feature = "servo", feature = "cef")))]
             {
