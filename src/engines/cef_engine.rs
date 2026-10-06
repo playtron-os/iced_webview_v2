@@ -154,6 +154,8 @@ struct SharedState {
     /// Every address the page took since the host last asked, in order:
     /// a redirect the next load replaces within one tick still reaches it.
     url_changes: Vec<String>,
+    /// Failed loads to draw no error page for; see `Engine::set_quiet_failures`.
+    quiet_failures: Option<crate::engines::QuietFailures>,
     popup_url: Option<String>,
     title: Option<String>,
     cursor_type: CursorType,
@@ -953,6 +955,13 @@ wrap_load_handler! {
             if frame.is_main() != 0 && !url.is_empty() {
                 self.shared.borrow_mut().url_changes.push(url.clone());
             }
+            // A failure the host expects, such as a sign-in's redirect to
+            // `localhost`: it takes the view down on seeing the address, and an
+            // error page would only flash in between.
+            let quiet = self.shared.borrow().quiet_failures.clone();
+            if quiet.is_some_and(|quiet| quiet(&url)) {
+                return;
+            }
             let body = format!(
                 "{ERROR_PAGE_HEAD}\
                  <h2>Failed to load</h2><p>{}</p><p style=\"color:#666\">{}</p></body></html>",
@@ -1358,6 +1367,10 @@ pub struct Cef {
     /// `User-Agent` to present, or `None` for the CEF default.
     /// Applied per view (see `Engine::set_user_agent`).
     user_agent: Option<String>,
+    /// Failed loads new views draw no error page for.
+    quiet_failures: Option<crate::engines::QuietFailures>,
+    /// Whether new views start with a profile of their own, kept in memory.
+    private: bool,
     /// BCP-47 language for `Accept-Language`, or `None` for the CEF default.
     /// Process-wide, so it must be set before the first view is created.
     locale: Option<String>,
@@ -1379,6 +1392,8 @@ impl Default for Cef {
             background_color: None,
             block_navigation: false,
             user_agent: None,
+            quiet_failures: None,
+            private: false,
             locale: None,
         }
     }
@@ -1494,6 +1509,7 @@ impl Cef {
             persistent_size: (0, 0),
             url: None,
             url_changes: Vec::new(),
+            quiet_failures: self.quiet_failures.clone(),
             popup_url: None,
             title: None,
             cursor_type: CursorType::POINTER,
@@ -1538,6 +1554,12 @@ impl Cef {
             ..Default::default()
         };
 
+        // No cache path: a context of its own that lives in memory, so the
+        // view starts with no cookies from earlier ones and leaves none.
+        let mut context = self
+            .private
+            .then(|| request_context_create_context(Some(&RequestContextSettings::default()), None))
+            .flatten();
         let initial_url = CefString::from("about:blank");
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1545,7 +1567,7 @@ impl Cef {
             Some(&initial_url),
             Some(&browser_settings),
             None,
-            None,
+            context.as_mut(),
         )?;
 
         // Give the new browser host focus immediately. Off-screen rendering has
@@ -1873,6 +1895,14 @@ impl Engine for Cef {
 
     fn set_user_agent(&mut self, user_agent: Option<String>) {
         self.user_agent = user_agent;
+    }
+
+    fn set_quiet_failures(&mut self, quiet: Option<crate::engines::QuietFailures>) {
+        self.quiet_failures = quiet;
+    }
+
+    fn set_private(&mut self, private: bool) {
+        self.private = private;
     }
 
     fn set_locale(&mut self, locale: Option<String>) {
@@ -2593,3 +2623,4 @@ fn iced_key_to_cef(key: &keyboard::Key) -> Option<(i32, u16)> {
         _ => None,
     }
 }
+

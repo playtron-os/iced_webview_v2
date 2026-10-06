@@ -6,6 +6,9 @@ use iced::mouse::{self, Interaction};
 use iced::Point;
 use iced::Size;
 
+/// Which failed loads draw no error page; see [`Engine::set_quiet_failures`].
+pub type QuietFailures = std::rc::Rc<dyn Fn(&str) -> bool>;
+
 /// A completed `eval` requested by the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvalResult {
@@ -173,6 +176,19 @@ pub trait Engine {
     /// the required UA isn't known until a specific flow starts, and different
     /// flows in one session need different values.
     fn set_user_agent(&mut self, _user_agent: Option<String>) {}
+
+    /// Draw no error page for a failed load whose URL `quiet` accepts; its
+    /// address is still reported. For a failure the host expects, as an OAuth
+    /// sign-in's redirect to `localhost`, which it takes the view down on.
+    /// `None`, the default, draws one for every failure.
+    ///
+    /// Applies to views created afterwards, as [`Engine::set_user_agent`] does.
+    fn set_quiet_failures(&mut self, _quiet: Option<QuietFailures>) {}
+
+    /// Give each view created afterwards a profile of its own, kept in memory:
+    /// no cookies or storage from earlier views, and none left behind. For a
+    /// sign-in that must not find the account the last one used.
+    fn set_private(&mut self, _private: bool) {}
 
     /// Set the language to request from sites (`Accept-Language`, and the
     /// browser UI locale where the engine has one).
