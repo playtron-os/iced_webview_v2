@@ -1369,6 +1369,8 @@ pub struct Cef {
     user_agent: Option<String>,
     /// Failed loads new views draw no error page for.
     quiet_failures: Option<crate::engines::QuietFailures>,
+    /// Whether new views start with a profile of their own, kept in memory.
+    private: bool,
     /// BCP-47 language for `Accept-Language`, or `None` for the CEF default.
     /// Process-wide, so it must be set before the first view is created.
     locale: Option<String>,
@@ -1391,6 +1393,7 @@ impl Default for Cef {
             block_navigation: false,
             user_agent: None,
             quiet_failures: None,
+            private: false,
             locale: None,
         }
     }
@@ -1551,6 +1554,12 @@ impl Cef {
             ..Default::default()
         };
 
+        // No cache path: a context of its own that lives in memory, so the
+        // view starts with no cookies from earlier ones and leaves none.
+        let mut context = self
+            .private
+            .then(|| request_context_create_context(Some(&RequestContextSettings::default()), None))
+            .flatten();
         let initial_url = CefString::from("about:blank");
         let browser = browser_host_create_browser_sync(
             Some(&window_info),
@@ -1558,7 +1567,7 @@ impl Cef {
             Some(&initial_url),
             Some(&browser_settings),
             None,
-            None,
+            context.as_mut(),
         )?;
 
         // Give the new browser host focus immediately. Off-screen rendering has
@@ -1890,6 +1899,10 @@ impl Engine for Cef {
 
     fn set_quiet_failures(&mut self, quiet: Option<crate::engines::QuietFailures>) {
         self.quiet_failures = quiet;
+    }
+
+    fn set_private(&mut self, private: bool) {
+        self.private = private;
     }
 
     fn set_locale(&mut self, locale: Option<String>) {

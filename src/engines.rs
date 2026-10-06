@@ -185,6 +185,11 @@ pub trait Engine {
     /// Applies to views created afterwards, as [`Engine::set_user_agent`] does.
     fn set_quiet_failures(&mut self, _quiet: Option<QuietFailures>) {}
 
+    /// Give each view created afterwards a profile of its own, kept in memory:
+    /// no cookies or storage from earlier views, and none left behind. For a
+    /// sign-in that must not find the account the last one used.
+    fn set_private(&mut self, _private: bool) {}
+
     /// Set the language to request from sites (`Accept-Language`, and the
     /// browser UI locale where the engine has one).
     ///

@@ -260,6 +260,15 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
             .set_quiet_failures(quiet.map(|quiet| std::rc::Rc::new(quiet) as _));
     }
 
+    /// Give each view created afterwards a profile of its own, kept in memory:
+    /// it finds no cookies or storage from earlier views, and leaves none. For
+    /// a sign-in that must not reuse the account the last one signed in to.
+    ///
+    /// Applies to views created afterwards — call it before `CreateView`.
+    pub fn set_private(&mut self, private: bool) {
+        self.engine.set_private(private);
+    }
+
     /// Request `locale` from sites via `Accept-Language`.
     ///
     /// Process-wide for CEF and fixed once the browser starts, so call it
