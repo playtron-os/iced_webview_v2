@@ -249,6 +249,17 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.set_user_agent(user_agent);
     }
 
+    /// Draw no error page for a failed load whose URL `quiet` accepts; the
+    /// address is still reported through `on_url_change`. For a failure the
+    /// host expects, as an OAuth sign-in's redirect to `localhost`. `None`
+    /// draws one for every failure.
+    ///
+    /// Applies to views created afterwards — call it before `CreateView`.
+    pub fn set_quiet_failures(&mut self, quiet: Option<impl Fn(&str) -> bool + 'static>) {
+        self.engine
+            .set_quiet_failures(quiet.map(|quiet| std::rc::Rc::new(quiet) as _));
+    }
+
     /// Request `locale` from sites via `Accept-Language`.
     ///
     /// Process-wide for CEF and fixed once the browser starts, so call it
