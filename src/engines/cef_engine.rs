@@ -151,6 +151,9 @@ struct SharedState {
     persistent_buffer: Arc<Vec<u8>>,
     persistent_size: (u32, u32),
     url: Option<String>,
+    /// Every address the page took since the host last asked, in order:
+    /// a redirect the next load replaces within one tick still reaches it.
+    url_changes: Vec<String>,
     popup_url: Option<String>,
     title: Option<String>,
     cursor_type: CursorType,
@@ -764,7 +767,9 @@ wrap_display_handler! {
             url: Option<&CefString>,
         ) {
             if let Some(url) = url {
-                self.shared.borrow_mut().url = Some(url.to_string());
+                let mut shared = self.shared.borrow_mut();
+                shared.url = Some(url.to_string());
+                shared.url_changes.push(url.to_string());
             }
         }
 
@@ -1481,6 +1486,7 @@ impl Cef {
             persistent_buffer: Arc::new(Vec::new()),
             persistent_size: (0, 0),
             url: None,
+            url_changes: Vec::new(),
             popup_url: None,
             title: None,
             cursor_type: CursorType::POINTER,
@@ -2229,6 +2235,12 @@ impl Engine for Cef {
         } else {
             view.url.clone()
         }
+    }
+
+    fn take_url_changes(&mut self, id: ViewId) -> Vec<String> {
+        self.find_view(id)
+            .map(|view| std::mem::take(&mut view.shared.borrow_mut().url_changes))
+            .unwrap_or_default()
     }
 
     fn take_popup_url(&mut self, id: ViewId) -> Option<String> {

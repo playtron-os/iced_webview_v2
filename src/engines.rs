@@ -339,6 +339,13 @@ pub trait Engine {
         Vec::new()
     }
 
+    /// Take every address a view moved through since the last call, oldest
+    /// first. An engine that only knows its latest address returns nothing,
+    /// and the webview layer polls [`get_url`](Self::get_url) instead.
+    fn take_url_changes(&mut self, _id: ViewId) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Take a pending popup URL from a view, if any.
     ///
     /// Called by the webview layer each update tick to detect popup requests.

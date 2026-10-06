@@ -384,10 +384,19 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 }
             }
             if let Some(on_url_change) = &self.on_url_change {
-                let url = self.engine.get_url(self.get_current_view_id());
-                if self.url != url {
-                    self.url = url.clone();
-                    tasks.push(Task::done(on_url_change(url)))
+                // Each address in turn: a redirect that fails to load is
+                // replaced by the error page before the next poll, and the
+                // host may be waiting for exactly that redirect.
+                let view_id = self.get_current_view_id();
+                let mut changes = self.engine.take_url_changes(view_id);
+                if changes.is_empty() {
+                    changes.push(self.engine.get_url(view_id));
+                }
+                for url in changes {
+                    if self.url != url {
+                        self.url = url.clone();
+                        tasks.push(Task::done(on_url_change(url)));
+                    }
                 }
             }
             if let Some(on_title_change) = &self.on_title_change {
