@@ -946,6 +946,13 @@ wrap_load_handler! {
             }
 
             let Some(frame) = frame else { return };
+            // A redirect that cannot load, such as an OAuth flow's to
+            // `localhost`, never commits, so no address change reports it;
+            // the error page below replaces it first. The host may be waiting
+            // for exactly that address.
+            if frame.is_main() != 0 && !url.is_empty() {
+                self.shared.borrow_mut().url_changes.push(url.clone());
+            }
             let body = format!(
                 "{ERROR_PAGE_HEAD}\
                  <h2>Failed to load</h2><p>{}</p><p style=\"color:#666\">{}</p></body></html>",
