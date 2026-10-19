@@ -115,6 +115,11 @@ fn decide_accelerated_paint() -> (bool, &'static str) {
     )
 }
 
+/// `url` up to its `#`, so a document and its anchors compare equal.
+fn without_fragment(url: &str) -> &str {
+    url.split_once('#').map_or(url, |(document, _)| document)
+}
+
 /// Shared mutable state populated by CEF handler callbacks and drained
 /// each `update()` tick.
 struct SharedState {
@@ -169,6 +174,9 @@ struct SharedState {
     /// from the loaded document and surfaces them via `popup_url` instead.
     /// Opt-in; off by default so the view behaves like a normal browser.
     block_navigation: bool,
+    /// The document the host itself loaded with `PageType::Url`, without its
+    /// fragment. A blocked view still navigates there, and to its anchors.
+    host_document: Option<String>,
     /// Where the native popup (a `<select>` list, autofill menu) sits, in view
     /// coordinates, while it is showing.
     popup_rect: Option<(u32, u32, u32, u32)>,
@@ -1069,6 +1077,11 @@ wrap_request_handler! {
             if url.is_empty() || url.starts_with("data:") || url == "about:blank" {
                 return 0; // allow
             }
+            // Or the URL the host loaded itself, such as a page written to a
+            // file because it is too long for a `data:` URL, and its anchors.
+            if self.shared.borrow().host_document.as_deref() == Some(without_fragment(&url)) {
+                return 0; // allow
+            }
 
             // A real navigation (link click). Cancel it and hand the URL to
             // the host to open externally.
@@ -1518,6 +1531,7 @@ impl Cef {
             page_loaded: false,
             console_messages: Vec::new(),
             block_navigation: self.block_navigation,
+            host_document: None,
             popup_rect: None,
             eval_results: Vec::new(),
             editable_focus: false,
@@ -2190,6 +2204,7 @@ impl Engine for Cef {
         match page_type {
             PageType::Url(url) => {
                 view.url = url.clone();
+                view.shared.borrow_mut().host_document = Some(without_fragment(&url).to_owned());
                 let cef_url = CefString::from(url.as_str());
                 frame.load_url(Some(&cef_url));
             }
