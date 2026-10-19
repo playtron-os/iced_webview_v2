@@ -1,5 +1,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::Arc;
 
 use iced::keyboard;
 use iced::mouse::{self, Interaction};
@@ -203,6 +206,158 @@ impl DocumentContainer for WebviewContainer {
 /// `LitehtmlView`. The container is heap-allocated for address stability.
 /// `doc_state` is always dropped before the container is modified or dropped
 /// (field drop order: `doc_state` is declared before `container`).
+/// A page longer than this is laid out away from the window: its start at
+/// once, so the top shows straight away, and the rest on a thread of its own.
+const BACKGROUND_BYTES: usize = 256 * 1024;
+/// How much of a long page is laid out at once.
+const FIRST_BYTES: usize = 64 * 1024;
+/// The step between the start and the whole page, so a reader who scrolls
+/// on finds more before all of it is ready.
+const SECOND_BYTES: usize = 1024 * 1024;
+/// A frame holding the whole page past this many bytes of pixels holds only
+/// the part around where the page is scrolled to.
+const FULL_FRAME_BYTES: u64 = 64 * 1024 * 1024;
+/// How many bytes of pixels that part may take. litehtml walks the whole page
+/// on every draw, so the part is drawn again rarely, and each time costs that
+/// walk plus this much rastering.
+const WINDOW_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The start of `html` through the end of a closing tag at or after `bytes`,
+/// outside any comment, script or style, so what is cut off is whole
+/// elements; litehtml closes what is still open. `None` when no such tag
+/// comes after `bytes`.
+fn prefix(html: &str, bytes: usize) -> Option<&str> {
+    let raw = html.as_bytes();
+    let lower = |at: usize, word: &str| {
+        raw.get(at..at + word.len())
+            .is_some_and(|got| got.eq_ignore_ascii_case(word.as_bytes()))
+    };
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if lower(i, "<!--") {
+            i = html[i..].find("-->").map_or(raw.len(), |end| i + end + 3);
+            continue;
+        }
+        let raw_text = ["script", "style", "textarea", "title"]
+            .into_iter()
+            .find(|tag| lower(i + 1, tag));
+        if let Some(tag) = raw_text {
+            let close = format!("</{tag}");
+            let found = html[i..]
+                .to_ascii_lowercase()
+                .find(&close)
+                .map(|end| i + end + close.len());
+            i = found.unwrap_or(raw.len());
+            continue;
+        }
+        let closing = raw.get(i + 1) == Some(&b'/');
+        let end = html[i..].find('>').map_or(raw.len(), |end| i + end + 1);
+        if closing && end > bytes && end < raw.len() {
+            return Some(&html[..end]);
+        }
+        i = end;
+    }
+    None
+}
+
+/// A document laid out on a thread of its own, with the container it borrows.
+/// Field order is drop order: the document before its container.
+struct Built {
+    state: Option<DocumentState>,
+    container: Box<WebviewContainer>,
+    content_height: f32,
+    generation: u64,
+    /// The whole page, not a start of it.
+    complete: bool,
+}
+
+// SAFETY: a `Built` is made on one thread and then only ever used on the one
+// it is sent to. Its `Rc`s (the font system the container and the measuring
+// closure share) and the litehtml document all travel inside it together, so
+// nothing it holds is reachable from two threads at once.
+unsafe impl Send for Built {}
+
+/// Lay out `html` in `container`, at `w` by `h`. With `second_pass`, a page
+/// taller than the first viewport is laid out again with the viewport as tall
+/// as the page, so `100vh` covers it; a long page is laid out once.
+fn lay_out(
+    container: &mut Box<WebviewContainer>,
+    html: &str,
+    w: u32,
+    h: u32,
+    second_pass: bool,
+) -> (Option<DocumentState>, f32) {
+    if w == 0 || h == 0 || html.is_empty() {
+        return (None, 0.0);
+    }
+    // Pass 1: use a tall viewport so CSS `100vh` doesn't cap content height.
+    let layout_h = h.max(10_000);
+    container.inner_mut().resize(w, layout_h);
+    let measure = container.inner().text_measure_fn();
+
+    // SAFETY: Manual lifetime extension is required here due to litehtml API constraints.
+    //
+    // The litehtml Document<'a> type is invariant over its lifetime parameter and
+    // requires a mutable borrow of the container. This makes it incompatible with
+    // self-referential struct crates like ouroboros or self_cell, which cannot handle:
+    //   1. Lifetime invariance (they require covariance)
+    //   2. Multiple mutable borrows from the same field (Document and Selection)
+    //
+    // The unsafe lifetime extension to 'static is safe because:
+    //   1. container is Box<WebviewContainer> — heap-allocated with a stable address
+    //   2. the document is always stored beside its container and dropped first
+    //   3. the document is dropped before any container modification or drop
+    //   4. The Document never outlives the container it borrows from
+    let container_ptr = &mut **container as *mut WebviewContainer;
+    let container_ref: &'static mut WebviewContainer = unsafe { &mut *container_ptr };
+    let mut doc = match Document::from_html(html, container_ref, None, None) {
+        Ok(doc) => doc,
+        Err(e) => {
+            eprintln!("litehtml: from_html failed: {e:?}");
+            return (None, 0.0);
+        }
+    };
+    let _ = doc.render(w as f32);
+    let measured = doc.height();
+    if !second_pass || measured <= layout_h as f32 {
+        let state = DocumentState {
+            doc,
+            measure: Box::new(measure),
+            selection: Selection::new(),
+        };
+        return (Some(state), measured);
+    }
+
+    // Pass 2: re-layout so `100vh` covers the full content and overflow clips
+    // don't cut it off. Drop the document BEFORE resizing: resizing while it
+    // holds a &mut borrow of the container would make two live &mut references.
+    drop(doc);
+    container.inner_mut().resize(w, measured.ceil() as u32);
+    let measure = container.inner().text_measure_fn();
+    let container_ptr = &mut **container as *mut WebviewContainer;
+    let container_ref: &'static mut WebviewContainer = unsafe { &mut *container_ptr };
+    match Document::from_html(html, container_ref, None, None) {
+        Err(e) => {
+            eprintln!("litehtml: from_html pass 2 failed: {e:?}");
+            (None, 0.0)
+        }
+        Ok(mut doc) => {
+            let _ = doc.render(w as f32);
+            let height = doc.height();
+            let state = DocumentState {
+                doc,
+                measure: Box::new(measure),
+                selection: Selection::new(),
+            };
+            (Some(state), height)
+        }
+    }
+}
+
 struct DocumentState {
     doc: Document<'static>,
     #[allow(clippy::type_complexity)]
@@ -230,9 +385,26 @@ struct LitehtmlView {
     selection_rects: Vec<[f32; 4]>,
     scroll_y: f32,
     content_height: f32,
+    /// The part of the page `last_frame` holds, in logical pixels: all of
+    /// it, or for a long page the part around `scroll_y`.
+    frame_top: f32,
+    frame_height: f32,
+    /// Which way the page last scrolled: a long page's next frame reaches
+    /// ahead that way.
+    scrolling_up: bool,
     size: Size<u32>,
     drag_origin: Option<(f32, f32)>,
     drag_active: bool,
+    /// Every image loaded into the page so far, for a layout made on another
+    /// thread to start with.
+    images: Vec<(String, Vec<u8>)>,
+    /// Images that came while a long page was laid out elsewhere; it is laid
+    /// out once more with them.
+    images_since_layout: bool,
+    /// Where a long page's layouts arrive, while one is still to come.
+    building: Option<Receiver<Built>>,
+    /// The newest layout asked for; an older one landing is dropped.
+    latest: Arc<AtomicU64>,
 }
 
 /// CPU-based HTML rendering engine backed by litehtml.
@@ -269,11 +441,9 @@ impl Litehtml {
     }
 }
 
-/// Build a persistent Document for the view, storing it alongside its
-/// text-measurement closure and a fresh Selection.
-///
-/// Drops any existing document state first (releasing the container borrow),
-/// then resizes the container, creates a new Document, and renders the layout.
+/// Lay the view's page out. A short page is laid out here and now. A long
+/// one has its start laid out here, so its top shows at once, and the rest on
+/// a thread of its own (see [`lay_out_in_background`]).
 fn rebuild_document(view: &mut LitehtmlView) {
     view.doc_state = None;
 
@@ -282,94 +452,154 @@ fn rebuild_document(view: &mut LitehtmlView) {
     if !view.staged_images.is_empty() {
         for (url, bytes, _) in view.staged_images.drain(..) {
             view.container.inner_mut().load_image_data(&url, &bytes);
+            view.images.push((url, bytes));
         }
     }
 
-    let w = view.size.width;
-    let h = view.size.height;
-
-    if w == 0 || h == 0 || view.html.is_empty() {
+    let (w, h) = (view.size.width, view.size.height);
+    if view.html.len() <= BACKGROUND_BYTES {
+        view.latest.fetch_add(1, Ordering::SeqCst);
+        view.building = None;
+        let (state, height) = lay_out(&mut view.container, &view.html, w, h, true);
+        view.doc_state = state;
+        view.content_height = height;
         return;
     }
+    let start = prefix(&view.html, FIRST_BYTES).unwrap_or_default();
+    let (state, height) = lay_out(&mut view.container, start, w, h, false);
+    view.doc_state = state;
+    view.content_height = height;
+    lay_out_in_background(view);
+}
 
-    // Pass 1: use a tall viewport so CSS `100vh` doesn't cap content height.
-    let layout_h = h.max(10_000);
-    view.container.inner_mut().resize(w, layout_h);
-
-    // Capture the text measurement closure before borrowing the container
-    let measure = view.container.inner().text_measure_fn();
-
-    // SAFETY: Manual lifetime extension is required here due to litehtml API constraints.
-    //
-    // The litehtml Document<'a> type is invariant over its lifetime parameter and
-    // requires a mutable borrow of the container. This makes it incompatible with
-    // self-referential struct crates like ouroboros or self_cell, which cannot handle:
-    //   1. Lifetime invariance (they require covariance)
-    //   2. Multiple mutable borrows from the same field (Document and Selection)
-    //
-    // The unsafe lifetime extension to 'static is safe because:
-    //   1. container is Box<WebviewContainer> — heap-allocated with a stable address
-    //   2. doc_state is declared before container in LitehtmlView → drops first
-    //   3. doc_state is set to None before any container modification or drop
-    //   4. The Document never outlives the container it borrows from
-    //
-    // This pattern has been carefully reviewed and is the standard approach for
-    // self-referential structures when safe abstractions are incompatible.
-    let container_ptr = &mut *view.container as *mut WebviewContainer;
-    let container_ref: &'static mut WebviewContainer = unsafe { &mut *container_ptr };
-
-    match Document::from_html(&view.html, container_ref, None, None) {
-        Err(e) => {
-            eprintln!("litehtml: from_html failed: {e:?}");
-        }
-        Ok(mut doc) => {
-            let _ = doc.render(w as f32);
-            let measured = doc.height();
-
-            // Pass 2: if content overflows the layout viewport, re-layout so
-            // `100vh` covers the full content and overflow clips don't cut it off.
-            if measured > layout_h as f32 {
-                let final_h = measured.ceil() as u32;
-
-                // Drop the document BEFORE resizing. Calling resize while doc
-                // holds a &mut borrow of the container would create two live
-                // &mut references — undefined behavior.
-                drop(doc);
-
-                view.container.inner_mut().resize(w, final_h);
-                let measure2 = view.container.inner().text_measure_fn();
-
-                let container_ptr2 = &mut *view.container as *mut WebviewContainer;
-                let container_ref2: &'static mut WebviewContainer = unsafe { &mut *container_ptr2 };
-
-                match Document::from_html(&view.html, container_ref2, None, None) {
-                    Err(e) => {
-                        eprintln!("litehtml: from_html pass 2 failed: {e:?}");
-                    }
-                    Ok(mut doc2) => {
-                        let _ = doc2.render(w as f32);
-                        view.content_height = doc2.height();
-
-                        let selection: Selection<'static> = Selection::new();
-                        view.doc_state = Some(DocumentState {
-                            doc: doc2,
-                            measure: Box::new(measure2),
-                            selection,
-                        });
-                    }
+/// Lay a long page out on a thread of its own: its first megabyte, then all
+/// of it, each sent back as it is done. A newer layout asked for meanwhile
+/// makes this one stop at its next step.
+fn lay_out_in_background(view: &mut LitehtmlView) {
+    let generation = view.latest.fetch_add(1, Ordering::SeqCst) + 1;
+    let latest = Arc::clone(&view.latest);
+    let (tx, rx) = mpsc::channel();
+    let html = view.html.clone();
+    let (w, h) = (view.size.width, view.size.height);
+    let scale = view.container.inner().scale_factor();
+    let base_url = view.container.base_url.clone();
+    let css = view.container.css_cache.borrow().clone();
+    let images = view.images.clone();
+    view.images_since_layout = false;
+    std::thread::spawn(move || {
+        for limit in [SECOND_BYTES, usize::MAX] {
+            if latest.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let complete = html.len() <= limit;
+            let text = if complete {
+                html.as_str()
+            } else if html.len() > limit * 2 {
+                match prefix(&html, limit) {
+                    Some(start) => start,
+                    None => continue,
                 }
             } else {
-                view.content_height = measured;
+                continue;
+            };
+            let mut container = Box::new(WebviewContainer::new(w, h, scale));
+            container.base_url = base_url.clone();
+            container.set_css_cache(css.clone());
+            for (url, bytes) in &images {
+                container.inner_mut().load_image_data(url, bytes);
+            }
+            let (state, content_height) = lay_out(&mut container, text, w, h, false);
+            let built = Built {
+                state,
+                container,
+                content_height,
+                generation,
+                complete,
+            };
+            if latest.load(Ordering::SeqCst) != generation || tx.send(built).is_err() {
+                return;
+            }
+            if complete {
+                return;
+            }
+        }
+    });
+    view.building = Some(rx);
+}
 
-                let selection: Selection<'static> = Selection::new();
-                view.doc_state = Some(DocumentState {
-                    doc,
-                    measure: Box::new(measure),
-                    selection,
-                });
+/// Put in place what a background layout sent, newest first wins; once the
+/// whole page has landed, lay it out again if images came meanwhile.
+fn take_built(view: &mut LitehtmlView) {
+    let Some(rx) = view.building.as_ref() else {
+        return;
+    };
+    let mut landed = Vec::new();
+    let mut finished = false;
+    loop {
+        match rx.try_recv() {
+            Ok(built) => landed.push(built),
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                finished = true;
+                break;
             }
         }
     }
+    let current = view.latest.load(Ordering::SeqCst);
+    for built in landed {
+        if built.generation != current {
+            continue;
+        }
+        let Built {
+            state,
+            container,
+            content_height,
+            complete,
+            ..
+        } = built;
+        // The old document goes before the container it borrows.
+        view.doc_state = None;
+        view.container = container;
+        view.doc_state = state;
+        view.content_height = content_height;
+        let max_scroll = (content_height - view.size.height as f32).max(0.0);
+        view.scroll_y = view.scroll_y.clamp(0.0, max_scroll);
+        view.needs_render = true;
+        finished |= complete;
+    }
+    if finished {
+        view.building = None;
+        if view.images_since_layout {
+            lay_out_in_background(view);
+        }
+    }
+}
+
+/// The part of the page a frame holds, as `(top, height)` in logical pixels:
+/// all of it, or, when that is more than [`FULL_FRAME_BYTES`], as much as
+/// [`WINDOW_FRAME_BYTES`] allows (three windows at least), one window behind
+/// where the page is scrolled to and the rest ahead, the way it scrolls.
+fn frame_window(view: &LitehtmlView) -> (u32, u32) {
+    let full_h = (view.content_height.ceil() as u32).max(view.size.height);
+    let scale = f64::from(view.container.inner().scale_factor());
+    let row_bytes = f64::from(view.size.width.max(1)) * scale * scale * 4.0;
+    if f64::from(full_h) * row_bytes <= FULL_FRAME_BYTES as f64 {
+        return (0, full_h);
+    }
+    let h = view.size.height;
+    let window = (WINDOW_FRAME_BYTES as f64 / row_bytes) as u32;
+    let height = window.max(h * 3).min(full_h);
+    let behind = if view.scrolling_up { height - 2 * h } else { h };
+    let top = (view.scroll_y as u32)
+        .saturating_sub(behind)
+        .min(full_h - height);
+    (top, height)
+}
+
+/// Whether the window on screen has left the part of the page the frame holds.
+fn outside_frame(view: &LitehtmlView) -> bool {
+    view.scroll_y < view.frame_top
+        || view.scroll_y + view.size.height as f32 > view.frame_top + view.frame_height
 }
 
 /// Draw the document into the pixel buffer and capture `last_frame`.
@@ -381,7 +611,9 @@ fn rebuild_document(view: &mut LitehtmlView) {
 /// where no aliasing is needed.
 fn capture_frame(view: &mut LitehtmlView, container_ptr: Option<*mut WebviewContainer>) {
     let w = view.size.width;
-    let full_h = (view.content_height.ceil() as u32).max(view.size.height);
+    let (top, full_h) = frame_window(view);
+    view.frame_top = top as f32;
+    view.frame_height = full_h as f32;
 
     // Resize + set_ignore_overflow_clips: use the raw pointer when provided
     // (Document holds a borrow), otherwise go through the safe reference.
@@ -403,7 +635,9 @@ fn capture_frame(view: &mut LitehtmlView, container_ptr: Option<*mut WebviewCont
             width: w as f32,
             height: full_h as f32,
         };
-        state.doc.draw(DrawContext(0), 0.0, 0.0, Some(clip));
+        state
+            .doc
+            .draw(DrawContext(0), 0.0, -(top as f32), Some(clip));
     }
 
     match container_ptr {
@@ -458,9 +692,13 @@ fn flush_images_and_redraw(view: &mut LitehtmlView) {
     let container_ptr = &mut *view.container as *mut WebviewContainer;
     for (url, bytes, _) in view.staged_images.drain(..) {
         unsafe { (*container_ptr).inner_mut().load_image_data(&url, &bytes) };
+        view.images.push((url, bytes));
     }
 
-    if needs_render {
+    // A long page is laid out again on its own thread rather than here.
+    if needs_render && view.html.len() > BACKGROUND_BYTES {
+        view.images_since_layout = true;
+    } else if needs_render {
         if let Some(ref mut state) = view.doc_state {
             let _ = state.doc.render(w as f32);
             view.content_height = state.doc.height();
@@ -468,6 +706,9 @@ fn flush_images_and_redraw(view: &mut LitehtmlView) {
     }
 
     capture_frame(view, Some(container_ptr));
+    if view.images_since_layout && view.building.is_none() {
+        lay_out_in_background(view);
+    }
 }
 
 /// Main render entry point: rebuilds the document if needed, then draws.
@@ -505,7 +746,7 @@ fn render_view(view: &mut LitehtmlView) {
 /// iced's `image::Handle::from_rgba` expects straight (unpremultiplied) alpha.
 fn unpremultiply_rgba(pixels: &[u8]) -> Vec<u8> {
     let mut result = Vec::with_capacity(pixels.len());
-    for chunk in pixels.chunks_exact(4) {
+    for chunk in pixels.as_chunks::<4>().0 {
         let a = chunk[3] as u32;
         let r = (chunk[0] as u32 * 255 + a / 2)
             .checked_div(a)
@@ -556,7 +797,9 @@ impl Engine for Litehtml {
     }
 
     fn update(&mut self) {
-        // No-op: litehtml has no async work or background tasks.
+        for view in &mut self.views {
+            take_built(view);
+        }
     }
 
     fn render(&mut self, _size: Size<u32>) {
@@ -609,9 +852,16 @@ impl Engine for Litehtml {
             selection_rects: Vec::new(),
             scroll_y: 0.0,
             content_height: 0.0,
+            frame_top: 0.0,
+            frame_height: 0.0,
+            scrolling_up: false,
             size,
             drag_origin: None,
             drag_active: false,
+            images: Vec::new(),
+            images_since_layout: false,
+            building: None,
+            latest: Arc::new(AtomicU64::new(0)),
         };
 
         render_view(&mut view);
@@ -641,10 +891,18 @@ impl Engine for Litehtml {
 
     fn resize(&mut self, size: Size<u32>) {
         for view in &mut self.views {
-            view.doc_state = None;
-
+            let width_changed = view.size.width != size.width;
             view.size = size;
             view.needs_render = true;
+            // A long page stays on screen at its old width until its new
+            // layout lands; a short one is laid out again now.
+            if view.html.len() > BACKGROUND_BYTES && view.doc_state.is_some() {
+                if width_changed {
+                    lay_out_in_background(view);
+                }
+                continue;
+            }
+            view.doc_state = None;
         }
     }
 
@@ -763,6 +1021,7 @@ impl Engine for Litehtml {
 
     fn scroll(&mut self, id: ViewId, _point: Point, delta: mouse::ScrollDelta) {
         let view = self.find_view_mut(id);
+        let was = view.scroll_y;
         match delta {
             mouse::ScrollDelta::Lines { y, .. } => {
                 view.scroll_y -= y * 40.0;
@@ -773,6 +1032,12 @@ impl Engine for Litehtml {
         }
         let max_scroll = (view.content_height - view.size.height as f32).max(0.0);
         view.scroll_y = view.scroll_y.clamp(0.0, max_scroll);
+        if view.scroll_y != was {
+            view.scrolling_up = view.scroll_y < was;
+        }
+        if outside_frame(view) {
+            view.needs_render = true;
+        }
     }
 
     fn goto(&mut self, id: ViewId, page_type: PageType) {
@@ -786,6 +1051,8 @@ impl Engine for Litehtml {
                 view.container.inner_mut().clear_pending_images();
                 // Clear image baseurls from the previous page
                 view.container.image_baseurls.borrow_mut().clear();
+                view.images.clear();
+                view.images_since_layout = false;
 
                 view.html = html;
                 view.scroll_y = 0.0;
@@ -840,6 +1107,15 @@ impl Engine for Litehtml {
 
     fn get_content_height(&self, id: ViewId) -> f32 {
         self.find_view(id).content_height
+    }
+
+    fn get_frame_rect(&self, id: ViewId) -> (f32, f32) {
+        let view = self.find_view(id);
+        (view.frame_top, view.frame_height)
+    }
+
+    fn layout_pending(&self, id: ViewId) -> bool {
+        self.find_view(id).building.is_some()
     }
 
     fn get_selected_text(&self, id: ViewId) -> Option<String> {
@@ -921,6 +1197,9 @@ impl Engine for Litehtml {
             let pos = el.placement();
             let max_scroll = (view.content_height - view.size.height as f32).max(0.0);
             view.scroll_y = pos.y.clamp(0.0, max_scroll);
+            if outside_frame(view) {
+                view.needs_render = true;
+            }
             true
         } else {
             false
