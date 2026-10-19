@@ -306,6 +306,14 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.owes_frame()
     }
 
+    /// Whether the current view is still being laid out away from the window
+    /// (a long litehtml page). Pump [`Action::Update`] on a clock while this
+    /// holds, so the rest of the page lands without waiting for input.
+    pub fn layout_pending(&self) -> bool {
+        self.current_view_id()
+            .is_some_and(|view_id| self.engine.layout_pending(view_id))
+    }
+
     /// Whether the focused element in the current view accepts text.
     pub fn has_editable_focus(&self) -> bool {
         self.current_view_id()
@@ -785,7 +793,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 self.engine.get_cursor(id),
                 self.engine.get_selection_rects(id),
                 self.engine.get_scroll_y(id),
-                content_height,
+                self.engine.get_frame_rect(id),
             )
             .into()
         } else {
@@ -814,7 +822,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     self.engine.get_cursor(id),
                     self.engine.get_selection_rects(id),
                     0.0,
-                    0.0,
+                    (0.0, 0.0),
                 )
                 .into()
             }
@@ -833,7 +841,8 @@ struct WebViewWidget<'a> {
     bounds: Size<u32>,
     selection_rects: &'a [[f32; 4]],
     scroll_y: f32,
-    content_height: f32,
+    /// The part of the page the image holds, `(top, height)`.
+    frame: (f32, f32),
 }
 
 impl<'a> WebViewWidget<'a> {
@@ -842,7 +851,7 @@ impl<'a> WebViewWidget<'a> {
         cursor: Interaction,
         selection_rects: &'a [[f32; 4]],
         scroll_y: f32,
-        content_height: f32,
+        frame: (f32, f32),
     ) -> Self {
         Self {
             handle: image_info.as_handle(),
@@ -850,7 +859,7 @@ impl<'a> WebViewWidget<'a> {
             bounds: Size::new(0, 0),
             selection_rects,
             scroll_y,
-            content_height,
+            frame,
         }
     }
 }
@@ -888,15 +897,18 @@ where
     ) {
         let bounds = layout.bounds();
 
-        if self.content_height > 0.0 {
-            // Full-document buffer: draw at negative y offset to scroll,
-            // clipped to widget bounds. The Handle stays stable across frames.
+        let (frame_top, frame_height) = self.frame;
+        if frame_height > 0.0 {
+            // Document buffer (all of it, or a long page's part around the
+            // window): drawn where it sits in the page, offset by the scroll
+            // and clipped to the widget. The Handle stays stable while the
+            // window stays inside it.
             renderer.with_layer(bounds, |renderer| {
                 let image_bounds = Rectangle {
                     x: bounds.x,
-                    y: bounds.y - self.scroll_y,
+                    y: bounds.y + frame_top - self.scroll_y,
                     width: bounds.width,
-                    height: self.content_height,
+                    height: frame_height,
                 };
                 renderer.draw_image(
                     core_image::Image::new(self.handle.clone()),

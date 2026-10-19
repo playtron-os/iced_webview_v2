@@ -197,6 +197,12 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
     /// now" — a committed buffer is not, since the surface may still be
     /// transparent, and the page reporting that it painted says only that the
     /// browser drew, not that we have a texture for it.
+    /// Whether view `id` is still being laid out away from the window (a long
+    /// litehtml page). Pump [`Action::Update`] while this holds.
+    pub fn layout_pending(&self, id: ViewId) -> bool {
+        self.engine.layout_pending(id)
+    }
+
     pub fn is_settled(&self, id: ViewId) -> bool {
         #[cfg(feature = "cef")]
         {
@@ -580,7 +586,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                 self.engine.get_cursor(id),
                 self.engine.get_selection_rects(id),
                 self.engine.get_scroll_y(id),
-                content_height,
+                self.engine.get_frame_rect(id),
             )
             .into()
         } else {
@@ -608,7 +614,7 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
                     self.engine.get_cursor(id),
                     self.engine.get_selection_rects(id),
                     0.0,
-                    0.0,
+                    (0.0, 0.0),
                 )
                 .into()
             }
@@ -765,7 +771,8 @@ struct WebViewWidget<'a> {
     cursor: Interaction,
     selection_rects: &'a [[f32; 4]],
     scroll_y: f32,
-    content_height: f32,
+    /// The part of the page the image holds, `(top, height)`.
+    frame: (f32, f32),
 }
 
 impl<'a> WebViewWidget<'a> {
@@ -776,7 +783,7 @@ impl<'a> WebViewWidget<'a> {
         cursor: Interaction,
         selection_rects: &'a [[f32; 4]],
         scroll_y: f32,
-        content_height: f32,
+        frame: (f32, f32),
     ) -> Self {
         Self {
             id,
@@ -785,7 +792,7 @@ impl<'a> WebViewWidget<'a> {
             cursor,
             selection_rects,
             scroll_y,
-            content_height,
+            frame,
         }
     }
 }
@@ -823,13 +830,14 @@ where
     ) {
         let bounds = layout.bounds();
 
-        if self.content_height > 0.0 {
+        let (frame_top, frame_height) = self.frame;
+        if frame_height > 0.0 {
             renderer.with_layer(bounds, |renderer| {
                 let image_bounds = Rectangle {
                     x: bounds.x,
-                    y: bounds.y - self.scroll_y,
+                    y: bounds.y + frame_top - self.scroll_y,
                     width: bounds.width,
-                    height: self.content_height,
+                    height: frame_height,
                 };
                 renderer.draw_image(
                     core_image::Image::new(self.handle.clone()),

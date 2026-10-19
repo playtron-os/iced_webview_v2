@@ -281,6 +281,19 @@ pub trait Engine {
         0.0
     }
 
+    /// The part of the page the view's frame holds, as `(top, height)` in
+    /// logical pixels: all of it, unless the engine draws a long page a
+    /// window at a time.
+    fn get_frame_rect(&self, id: ViewId) -> (f32, f32) {
+        (0.0, self.get_content_height(id))
+    }
+
+    /// Whether the view is still being laid out away from the window. A host
+    /// keeps sending `Action::Update` until it is not, so the rest lands.
+    fn layout_pending(&self, _id: ViewId) -> bool {
+        false
+    }
+
     /// Gets the currently selected text from a view, if any.
     fn get_selected_text(&self, _id: ViewId) -> Option<String> {
         None
