@@ -203,6 +203,12 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
         self.engine.layout_pending(id)
     }
 
+    /// Why the engine could not start, once it has tried: CEF starts with the
+    /// first view. Its views then stay blank, so show this instead.
+    pub fn initialization_error(&self) -> Option<&str> {
+        self.engine.initialization_error()
+    }
+
     pub fn is_settled(&self, id: ViewId) -> bool {
         #[cfg(feature = "cef")]
         {

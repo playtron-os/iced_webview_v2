@@ -314,6 +314,12 @@ impl<Engine: engines::Engine + Default, Message: Send + Clone + 'static> WebView
             .is_some_and(|view_id| self.engine.layout_pending(view_id))
     }
 
+    /// Why the engine could not start, once it has tried: CEF starts with the
+    /// first view. Its views then stay blank, so show this instead.
+    pub fn initialization_error(&self) -> Option<&str> {
+        self.engine.initialization_error()
+    }
+
     /// Whether the focused element in the current view accepts text.
     pub fn has_editable_focus(&self) -> bool {
         self.current_view_id()
