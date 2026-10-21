@@ -44,6 +44,10 @@ mod cef_dialog;
 #[cfg(feature = "cef")]
 pub mod cef_engine;
 
+/// Who owns a CEF profile, and clearing what a dead browser left in it
+#[cfg(feature = "cef")]
+mod cef_profile;
+
 /// Creation of new pages to be of a html type or a url
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub enum PageType {

@@ -314,7 +314,7 @@ mod tests {
         let page: Element<'static, Action, iced::Theme, Renderer> =
             Space::new().width(Length::Fill).height(Length::Fill).into();
         row![
-            Element::from(KeyboardFrame::new(page, None)),
+            Element::from(KeyboardFrame::new(page, None, Keyboard::default())),
             Space::new().width(Length::Fill).height(Length::Fill),
         ]
         .into()

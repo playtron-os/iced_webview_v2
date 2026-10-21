@@ -52,39 +52,6 @@ fn accelerated_paint_enabled() -> bool {
     })
 }
 
-/// Remove Chromium's singleton files, but only when nothing owns them.
-///
-/// `SingletonLock` is a symlink whose target is `hostname-pid`. If that process
-/// is still alive the profile is genuinely in use and the files must be left
-/// alone; deleting them lets a second instance believe it owns the profile, and
-/// the two then collide over every database inside it.
-fn clear_stale_singleton(cache_dir: &str) {
-    let dir = std::path::Path::new(cache_dir);
-    let lock = dir.join("SingletonLock");
-
-    if let Ok(target) = std::fs::read_link(&lock) {
-        let target = target.to_string_lossy().into_owned();
-        // `hostname-pid`, and a hostname may itself contain '-'.
-        let owner = target
-            .rsplit('-')
-            .next()
-            .and_then(|p| p.parse::<i32>().ok());
-        if let Some(pid) = owner {
-            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                log::debug!(
-                    "iced_webview: profile {cache_dir} is in use by pid {pid}, \
-                     leaving its lock alone"
-                );
-                return;
-            }
-        }
-    }
-
-    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let _ = std::fs::remove_file(dir.join(name));
-    }
-}
-
 /// The decision behind [`accelerated_paint_enabled`], and a phrase explaining it.
 fn decide_accelerated_paint() -> (bool, &'static str) {
     match std::env::var("ICED_WEBVIEW_ACCELERATED") {
@@ -1285,11 +1252,9 @@ fn ensure_cef_initialized() -> (bool, Option<&'static str>) {
         let cef_cache = format!("{cache_dir}/iced_webview_cef/{app}");
         let _ = std::fs::create_dir_all(&cef_cache);
 
-        // Clear the singleton files left by a crashed run — but only if they
-        // really are stale. Removing them unconditionally takes the profile
-        // away from an instance that is still using it, which is the same
-        // failure it is meant to prevent.
-        clear_stale_singleton(&cef_cache);
+        // Clear the singleton files left by a run that died, but only from a
+        // profile no running instance holds (see `cef_profile`).
+        super::cef_profile::claim_and_clear(std::path::Path::new(&cef_cache));
 
         let cef_dir = match cef::sys::get_cef_dir() {
             Some(dir) => dir,
