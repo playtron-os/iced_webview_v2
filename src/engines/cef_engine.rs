@@ -1395,6 +1395,19 @@ fn ensure_cef_lib_path() {
     }
 }
 
+/// Keep Mesa's device-select Vulkan layer out of this process and its helpers.
+///
+/// On every GPU enumeration it asks the compositor and Xwayland for their
+/// default GPU and blocks until they answer. The rendering-path probe
+/// enumerates on the host's UI thread and in each helper the browser waits
+/// for, so a slow display server froze the host. The layer only reorders GPUs,
+/// and the probe looks at every one of them.
+fn skip_device_select_layer() {
+    if std::env::var_os("NODEVICE_SELECT").is_none() {
+        unsafe { std::env::set_var("NODEVICE_SELECT", "1") };
+    }
+}
+
 /// Check if the current process is a CEF subprocess.
 ///
 /// Must be called at the very top of `main()`. Returns `true` if this
@@ -1402,6 +1415,7 @@ fn ensure_cef_lib_path() {
 /// exit immediately without starting the iced application.
 pub fn cef_subprocess_check() -> bool {
     ensure_cef_lib_path();
+    skip_device_select_layer();
     let _ = api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let args = Args::new();
 
