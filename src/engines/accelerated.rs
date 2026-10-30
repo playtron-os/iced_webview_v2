@@ -70,7 +70,8 @@ fn next_generation() -> u64 {
 ///
 /// Asked before the first browser is created, because that is when the choice
 /// gets baked in — see `accelerated_paint_enabled` in the CEF engine. Costs one
-/// adapter enumeration, once per process.
+/// adapter enumeration, run once on its own thread in the host process; helper
+/// processes are handed the answer.
 ///
 /// Note this is necessary rather than sufficient: it establishes that the
 /// driver can import dmabufs at all, not that every buffer the browser produces

@@ -38,8 +38,7 @@ use cef::*;
 /// even if the capability check says no, which is only useful for working out
 /// why the check disagrees with reality.
 fn accelerated_paint_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
+    *ACCELERATED.get_or_init(|| {
         let (enabled, why) = decide_accelerated_paint();
         // Always say which path was taken and why, at the moment it is decided.
         // The alternative is silence when the GPU path is chosen but no frame
@@ -52,14 +51,36 @@ fn accelerated_paint_enabled() -> bool {
     })
 }
 
+/// What [`accelerated_paint_enabled`] settled on. Helper processes set it from
+/// [`PAINT_SWITCH`] instead of deciding again.
+static ACCELERATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Carries the browser's decision to every helper it launches, as `gpu` or `cpu`.
+const PAINT_SWITCH: &str = "iced-webview-paint";
+
 /// The decision behind [`accelerated_paint_enabled`], and a phrase explaining it.
 fn decide_accelerated_paint() -> (bool, &'static str) {
+    if let Some(decided) = forced_or_unavailable() {
+        return decided;
+    }
+    match dmabuf_probe_result(DMABUF_PROBE_WAIT) {
+        Some(true) => (
+            true,
+            "Wayland session with a GPU that can import browser frames",
+        ),
+        Some(false) => (false, "no GPU here can import browser frames"),
+        None => (false, "the GPU probe did not answer in time"),
+    }
+}
+
+/// The decision when it does not need the GPU probe.
+fn forced_or_unavailable() -> Option<(bool, &'static str)> {
     match std::env::var("ICED_WEBVIEW_ACCELERATED") {
         Ok(v) if matches!(v.trim(), "0" | "false" | "no") => {
-            return (false, "forced by ICED_WEBVIEW_ACCELERATED=0");
+            return Some((false, "forced by ICED_WEBVIEW_ACCELERATED=0"));
         }
         Ok(v) if matches!(v.trim(), "1" | "true" | "yes") => {
-            return (true, "forced by ICED_WEBVIEW_ACCELERATED=1");
+            return Some((true, "forced by ICED_WEBVIEW_ACCELERATED=1"));
         }
         _ => {}
     }
@@ -69,17 +90,50 @@ fn decide_accelerated_paint() -> (bool, &'static str) {
     // buffers whose layout it declines to describe. And ozone wayland needs a
     // compositor to talk to.
     if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return (false, "not a Wayland session");
+        return Some((false, "not a Wayland session"));
     }
+    None
+}
 
-    if !super::accelerated::can_import_dmabuf() {
-        return (false, "no GPU here can import browser frames");
-    }
+/// How long CEF startup waits for the GPU probe before taking CPU frames.
+///
+/// Enumerating GPUs can wait on the compositor and Xwayland (Mesa's
+/// device-select layer asks both). The probe starts with the process and is
+/// normally done long before the first view; waiting past this would freeze
+/// the host's window instead.
+const DMABUF_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
-    (
-        true,
-        "Wayland session with a GPU that can import browser frames",
-    )
+static DMABUF_PROBE: std::sync::LazyLock<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Run [`super::accelerated::can_import_dmabuf`] once, off the calling thread.
+fn start_dmabuf_probe() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let finish = |found: bool| {
+            let (result, done) = &*DMABUF_PROBE;
+            *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(found);
+            done.notify_all();
+        };
+        let spawned = std::thread::Builder::new()
+            .name("webview-gpu".into())
+            .spawn(move || finish(super::accelerated::can_import_dmabuf()));
+        if let Err(e) = spawned {
+            log::warn!("iced_webview: probing the GPU inline, no thread for it: {e}");
+            finish(super::accelerated::can_import_dmabuf());
+        }
+    });
+}
+
+/// The probe's answer, waiting up to `wait` for it; `None` if it has not come.
+fn dmabuf_probe_result(wait: std::time::Duration) -> Option<bool> {
+    start_dmabuf_probe();
+    let (result, done) = &*DMABUF_PROBE;
+    let pending = result.lock().unwrap_or_else(|e| e.into_inner());
+    let (answer, _) = done
+        .wait_timeout_while(pending, wait, |r| r.is_none())
+        .unwrap_or_else(|e| e.into_inner());
+    *answer
 }
 
 /// `url` up to its `#`, so a document and its anchors compare equal.
@@ -372,6 +426,23 @@ wrap_render_process_handler! {
     }
 }
 
+// -- CEF browser-process handler --
+
+wrap_browser_process_handler! {
+    struct OsrBrowserProcessHandler;
+
+    impl BrowserProcessHandler {
+        fn on_before_child_process_launch(&self, command_line: Option<&mut CommandLine>) {
+            let Some(cmd) = command_line else { return };
+            let paint = if accelerated_paint_enabled() { "gpu" } else { "cpu" };
+            cmd.append_switch_with_value(
+                Some(&CefString::from(PAINT_SWITCH)),
+                Some(&CefString::from(paint)),
+            );
+        }
+    }
+}
+
 // -- CEF App handler --
 
 wrap_app! {
@@ -384,12 +455,29 @@ wrap_app! {
             Some(OsrRenderProcessHandler::new())
         }
 
+        fn browser_process_handler(&self) -> Option<BrowserProcessHandler> {
+            Some(OsrBrowserProcessHandler::new())
+        }
+
         fn on_before_command_line_processing(
             &self,
             process_type: Option<&CefString>,
             command_line: Option<&mut CommandLine>,
         ) {
             let Some(cmd) = command_line else { return };
+
+            // A helper takes the browser's decision instead of probing the GPU
+            // again: the browser's UI thread waits for the zygotes to start.
+            let is_browser_process = process_type.is_none_or(|t| t.to_string().is_empty());
+            if !is_browser_process {
+                let paint = CefString::from(&cmd.switch_value(Some(&CefString::from(PAINT_SWITCH))))
+                    .to_string();
+                match paint.as_str() {
+                    "gpu" => _ = ACCELERATED.set(true),
+                    "cpu" => _ = ACCELERATED.set(false),
+                    _ => {}
+                }
+            }
 
             // Which ozone platform to run depends on how frames are delivered.
             //
@@ -486,7 +574,6 @@ wrap_app! {
             );
 
             // The rest are browser-process only.
-            let is_browser_process = process_type.is_none_or(|t| t.to_string().is_empty());
             if !is_browser_process {
                 return;
             }
@@ -1395,27 +1482,16 @@ fn ensure_cef_lib_path() {
     }
 }
 
-/// Keep Mesa's device-select Vulkan layer out of this process and its helpers.
-///
-/// On every GPU enumeration it asks the compositor and Xwayland for their
-/// default GPU and blocks until they answer. The rendering-path probe
-/// enumerates on the host's UI thread and in each helper the browser waits
-/// for, so a slow display server froze the host. The layer only reorders GPUs,
-/// and the probe looks at every one of them.
-fn skip_device_select_layer() {
-    if std::env::var_os("NODEVICE_SELECT").is_none() {
-        unsafe { std::env::set_var("NODEVICE_SELECT", "1") };
-    }
-}
-
 /// Check if the current process is a CEF subprocess.
 ///
 /// Must be called at the very top of `main()`. Returns `true` if this
 /// process is a CEF helper (renderer, GPU, utility) — in that case,
 /// exit immediately without starting the iced application.
+///
+/// In the host process it also starts the GPU probe on a thread of its own,
+/// so set any environment the process needs before calling this.
 pub fn cef_subprocess_check() -> bool {
     ensure_cef_lib_path();
-    skip_device_select_layer();
     let _ = api_hash(cef::sys::CEF_API_VERSION_LAST, 0);
     let args = Args::new();
 
@@ -1431,6 +1507,9 @@ pub fn cef_subprocess_check() -> bool {
     // without calling execute_process(), which would set up CEF global
     // state that interferes with the later initialize() call.
     if is_browser {
+        if forced_or_unavailable().is_none() {
+            start_dmabuf_probe();
+        }
         return false;
     }
 
